@@ -1,0 +1,12 @@
+[package]
+name = "gbemu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+better_default = "1.0.5"
+bytes = "1.11.1"
+iced = { version = "0.14", features = ["canvas", "advanced", "image", "wgpu"] }
+iced_renderer = { version = "0.14.0", features = ["image", "wgpu", "iced_wgpu"] }
+tap = "1.0.1"
+tracing = "0.1.44"
