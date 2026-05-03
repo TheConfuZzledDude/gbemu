@@ -192,7 +192,6 @@ impl<'a> Deref for FlagsRegister {
     }
 }
 enum Operation {
-    Add(Target, Target),
     Nop,
     Halt,
     Load(Target, Target),
@@ -205,6 +204,32 @@ enum Operation {
     SetCarry,
     ComplementAccumulator,
     DecimalAdjustAccumulator,
+    Compare(Target, Target),
+    Or(Target, Target),
+    Xor(Target, Target),
+    And(Target, Target),
+    Sbc(Target, Target),
+    Sub(Target, Target),
+    Adc(Target, Target),
+    Add(Target, Target),
+    Return(Condition),
+    Push(Registers16),
+    Pop(Registers16),
+    ReturnInterrupt,
+    Jump(Condition, Target),
+    AddStack(i8),
+    LoadStackOffset(i8),
+    DisableInterrupt,
+    EnableInterrupt,
+    Call(Condition, Target),
+    Restart(u16),
+    Rotate(RotationType, Direction, Target),
+    ShiftArithmetic(Direction, Target),
+    Swap(Target),
+    ShiftRightLogical(Target),
+    TestBit(u8, Target),
+    ResetBit(u8, Target),
+    SetBit(u8, Target),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -223,6 +248,7 @@ enum Registers16 {
     DE,
     HL,
     SP,
+    AF,
 }
 
 enum Indirect {
@@ -230,7 +256,7 @@ enum Indirect {
     Imm16(u16),
     HLI,
     HLD,
-    C(u8),
+    C,
 }
 
 enum Target {
@@ -359,11 +385,11 @@ impl CPU {
         self.pc = self.pc.wrapping_add(1);
     }
 
-    fn cycle(&mut self) {
+    fn fetch(&mut self) {
         use Registers8::*;
         use Registers16::*;
         use Target::*;
-        let operation = match decompose_octal(self.ir) {
+        let operation = match decompose_octal_triplet(self.ir) {
             // https://gbdev.io/gb-opcodes/optables/octal
             (0o0, 0o0, 0o0) => Operation::Nop,
             (0o0, 0o1, 0o0) => {
@@ -525,14 +551,282 @@ impl CPU {
 
                 Operation::Load(destination, source)
             }
-            (0o2..=0o3, _, _) => {
-                todo!()
+            (0o2, op, target) => {
+                let target = match target {
+                    0 => R8(B),
+                    1 => R8(C),
+                    2 => R8(D),
+                    3 => R8(E),
+                    4 => R8(H),
+                    5 => R8(L),
+                    6 => Ind(Indirect::R16(HL)),
+                    7 => R8(A),
+                    _ => unreachable!(),
+                };
+                match op {
+                    0 => Operation::Add(R8(A), target),
+                    1 => Operation::Adc(R8(A), target),
+                    2 => Operation::Sub(R8(A), target),
+                    3 => Operation::Sbc(R8(A), target),
+                    4 => Operation::And(R8(A), target),
+                    5 => Operation::Xor(R8(A), target),
+                    6 => Operation::Or(R8(A), target),
+                    7 => Operation::Compare(R8(A), target),
+                    _ => unreachable!(),
+                }
+            }
+            (0o3, condition @ 0o0..=0o3, 0o0) => {
+                use Condition::*;
+                let condition = match condition {
+                    0o0 => NZ,
+                    0o1 => Z,
+                    0o2 => NC,
+                    0o3 => C,
+                    _ => unreachable!(),
+                };
+                Operation::Return(condition)
+            }
+            (0o3, kind @ (0o4 | 0o6), 0o0) => {
+                self.tick();
+                let offset = self.memory.read_u8(self.pc);
+                let address = u16::from_le_bytes([offset, 0xFF]);
+                match kind {
+                    0o4 => Operation::Load(Ind(Indirect::Imm16(address)), R8(A)),
+                    0o6 => Operation::Load(R8(A), Ind(Indirect::Imm16(address))),
+                    _ => unreachable!(),
+                }
+            }
+            (0o3, 0o5, 0o0) => {
+                self.tick();
+                let offset = self.memory.read_u8(self.pc) as i8;
+                Operation::AddStack(offset)
+            }
+            (0o3, 0o7, 0o0) => {
+                self.tick();
+                let offset = self.memory.read_u8(self.pc) as i8;
+                Operation::LoadStackOffset(offset)
+            }
+            (0o3, 0o7, 0o1) => Operation::Load(R16(SP), R16(HL)),
+            (0o3, target @ (0 | 2 | 4 | 6), kind @ (0o1 | 0o5)) => {
+                let target = match target {
+                    0 => BC,
+                    2 => DE,
+                    4 => HL,
+                    6 => AF,
+                    _ => unreachable!(),
+                };
+                match kind {
+                    0o1 => Operation::Pop(target),
+                    0o5 => Operation::Push(target),
+                    _ => unreachable!(),
+                }
+            }
+            (0o3, 0o1, 0o1) => Operation::Return(Condition::None),
+            (0o3, 0o3, 0o1) => Operation::ReturnInterrupt,
+            (0o3, 0o5, 0o1) => Operation::Jump(Condition::None, R16(HL)),
+            (0o3, condition @ 0o0..=0o3, 0o2) => {
+                use Condition::*;
+                let condition = match condition {
+                    0o0 => NZ,
+                    0o1 => Z,
+                    0o2 => NC,
+                    0o3 => C,
+                    _ => unreachable!(),
+                };
+                self.tick();
+                let lsb = self.memory.read_u8(self.pc);
+                self.tick();
+                let msb = self.memory.read_u8(self.pc);
+                let address = u16::from_le_bytes([lsb, msb]);
+                Operation::Jump(condition, Imm16(address))
+            }
+            (0o3, op @ 0o4..=0o7, 0o2) => {
+                let dest = if op & 1 == 0 {
+                    Ind(Indirect::C)
+                } else {
+                    self.tick();
+                    let lsb = self.memory.read_u8(self.pc);
+                    self.tick();
+                    let msb = self.memory.read_u8(self.pc);
+                    let address = u16::from_le_bytes([lsb, msb]);
+                    Ind(Indirect::Imm16(address))
+                };
+                let source = R8(A);
+                match op {
+                    0o4..=0o5 => Operation::Load(source, dest),
+                    0o6..=0o7 => Operation::Load(dest, source),
+                    _ => unreachable!(),
+                }
+            }
+            (0o3, 0o0, 0o3) => {
+                self.tick();
+                let lsb = self.memory.read_u8(self.pc);
+                self.tick();
+                let msb = self.memory.read_u8(self.pc);
+                let address = u16::from_le_bytes([lsb, msb]);
+                Operation::Jump(Condition::None, Imm16(address))
+            }
+            (0o3, 0o1, 0o3) => {
+                self.tick();
+                self.fetch_cb_operation()
+            }
+            (0o3, 0o2..=0o5, 0o3) => {
+                error!("Invalid opcode");
+                todo!("Decide what to do on invalid opcode")
+            }
+            (0o3, 0o6, 0o3) => Operation::DisableInterrupt,
+            (0o3, 0o7, 0o3) => Operation::EnableInterrupt,
+            (0o3, condition @ 0o0..=0o3, 0o4) => {
+                use Condition::*;
+                let condition = match condition {
+                    0o0 => NZ,
+                    0o1 => Z,
+                    0o2 => NC,
+                    0o3 => C,
+                    _ => unreachable!(),
+                };
+                self.tick();
+                let lsb = self.memory.read_u8(self.pc);
+                self.tick();
+                let msb = self.memory.read_u8(self.pc);
+                let address = u16::from_le_bytes([lsb, msb]);
+                Operation::Call(condition, Imm16(address))
+            }
+            (0o3, 0o4..=0o7, 0o4) => {
+                error!("Invalid opcode");
+                todo!("Decide what to do on invalid opcode")
+            }
+            (0o3, 0o1, 0o5) => {
+                self.tick();
+                let lsb = self.memory.read_u8(self.pc);
+                self.tick();
+                let msb = self.memory.read_u8(self.pc);
+                let address = u16::from_le_bytes([lsb, msb]);
+                Operation::Call(Condition::None, Imm16(address))
+            }
+            (0o3, 0o3 | 0o5 | 0o7, 0o5) => {
+                error!("Invalid opcode");
+                todo!("Decide what to do on invalid opcode")
+            }
+            (0o3, kind @ 0o0..=0o7, 0o6) => {
+                self.tick();
+                let value = self.memory.read_u8(self.pc);
+                let dest = R8(A);
+                let operation = match kind {
+                    0o0 => Operation::Add,
+                    0o1 => Operation::Adc,
+                    0o2 => Operation::Sub,
+                    0o3 => Operation::Sbc,
+                    0o4 => Operation::And,
+                    0o5 => Operation::Xor,
+                    0o6 => Operation::Or,
+                    0o7 => Operation::Compare,
+                    _ => unreachable!(),
+                };
+                operation(dest, Target::Imm8(value))
+            }
+            (0o3, variant @ 0o0..=0o7, 0o7) => {
+                let lsb = match variant {
+                    0o0 => 0x00,
+                    0o1 => 0x08,
+                    0o2 => 0x10,
+                    0o3 => 0x18,
+                    0o4 => 0x20,
+                    0o5 => 0x28,
+                    0o6 => 0x30,
+                    0o7 => 0x38,
+                    _ => unreachable!(),
+                };
+                let address = u16::from_le_bytes([lsb, 0x00]);
+                Operation::Restart(address)
             }
             (0o4.., _, _) | (_, 0o10.., _) | (_, _, 0o10..) => unreachable!(),
         };
     }
+
+    fn fetch_cb_operation(&self) -> Operation {
+        use Registers8::*;
+        use Registers16::*;
+        use Target::*;
+        let (operation, target) = decompose_octal_cb(self.memory.read_u8(self.pc));
+
+        let target = match target {
+            0o0 => R8(B),
+            0o1 => R8(C),
+            0o2 => R8(D),
+            0o3 => R8(E),
+            0o4 => R8(H),
+            0o5 => R8(L),
+            0o6 => Ind(Indirect::R16(HL)),
+            0o7 => R8(A),
+            _ => unreachable!(),
+        };
+
+        let operation = match operation {
+            0o0 => Operation::Rotate(RotationType::Circular, Direction::Left, target),
+            0o1 => Operation::Rotate(RotationType::Circular, Direction::Right, target),
+            0o2 => Operation::Rotate(RotationType::NonCircular, Direction::Left, target),
+            0o3 => Operation::Rotate(RotationType::NonCircular, Direction::Right, target),
+            0o4 => Operation::ShiftArithmetic(Direction::Left, target),
+            0o5 => Operation::ShiftArithmetic(Direction::Right, target),
+            0o6 => Operation::Swap(target),
+            0o7 => Operation::ShiftRightLogical(target),
+            number @ 0o10..=0o17 => Operation::TestBit(number - 0o10, target),
+            number @ 0o20..=0o27 => Operation::ResetBit(number - 0o20, target),
+            number @ 0o30..=0o37 => Operation::SetBit(number - 0o30, target),
+            0o40.. => unreachable!(),
+        };
+        operation
+    }
+
+    fn execute_operation(&mut self, operation: Operation) {
+        match operation {
+            Operation::Nop => todo!(),
+            Operation::Halt => todo!(),
+            Operation::Load(target, target1) => todo!(),
+            Operation::Inc(target) => todo!(),
+            Operation::Dec(target) => todo!(),
+            Operation::Stop => todo!(),
+            Operation::JumpRelative(_) => todo!(),
+            Operation::RotateAccumulator(rotation_type, direction) => todo!(),
+            Operation::ComplementCarry => todo!(),
+            Operation::SetCarry => todo!(),
+            Operation::ComplementAccumulator => todo!(),
+            Operation::DecimalAdjustAccumulator => todo!(),
+            Operation::Compare(target, target1) => todo!(),
+            Operation::Or(target, target1) => todo!(),
+            Operation::Xor(target, target1) => todo!(),
+            Operation::And(target, target1) => todo!(),
+            Operation::Sbc(target, target1) => todo!(),
+            Operation::Sub(target, target1) => todo!(),
+            Operation::Adc(target, target1) => todo!(),
+            Operation::Add(destination, source) => todo!(),
+            Operation::Return(condition) => todo!(),
+            Operation::Push(registers16) => todo!(),
+            Operation::Pop(registers16) => todo!(),
+            Operation::ReturnInterrupt => todo!(),
+            Operation::Jump(condition, target) => todo!(),
+            Operation::AddStack(_) => todo!(),
+            Operation::LoadStackOffset(_) => todo!(),
+            Operation::DisableInterrupt => todo!(),
+            Operation::EnableInterrupt => todo!(),
+            Operation::Call(condition, target) => todo!(),
+            Operation::Restart(_) => todo!(),
+            Operation::Rotate(rotation_type, direction, target) => todo!(),
+            Operation::ShiftArithmetic(direction, target) => todo!(),
+            Operation::Swap(target) => todo!(),
+            Operation::ShiftRightLogical(target) => todo!(),
+            Operation::TestBit(_, target) => todo!(),
+            Operation::ResetBit(_, target) => todo!(),
+            Operation::SetBit(_, target) => todo!(),
+        }
+    }
 }
 
-fn decompose_octal(value: u8) -> (u8, u8, u8) {
+fn decompose_octal_triplet(value: u8) -> (u8, u8, u8) {
     ((value >> 6) & 0o7, (value >> 3) & 0o7, value & 0o7)
+}
+
+fn decompose_octal_cb(value: u8) -> (u8, u8) {
+    ((value >> 3) & 0o77, value & 0o7)
 }
