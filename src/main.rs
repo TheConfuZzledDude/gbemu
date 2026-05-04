@@ -1,5 +1,5 @@
 use better_default::Default;
-use core::ops::{Deref, DerefMut};
+use core::ops::{Deref, DerefMut, Shl, Shr};
 use tracing::error;
 
 use bytes::BytesMut;
@@ -9,7 +9,7 @@ use iced::{
     Length::Fill,
     widget::canvas::{Cache, Canvas, Image},
 };
-
+use tap::{Conv, Pipe, Tap};
 fn main() -> iced::Result {
     iced::run(update, view)
 }
@@ -158,17 +158,21 @@ impl FlagsRegister {
         (self.0 >> 4) & 1 != 0
     }
 
-    fn set_zero(&mut self, value: bool) {
+    fn set_zero(&mut self, value: bool) -> &mut Self {
         self.0 |= u8::from(value) << 7;
+        self
     }
-    fn set_subtract(&mut self, value: bool) {
+    fn set_subtract(&mut self, value: bool) -> &mut Self {
         self.0 |= u8::from(value) << 6;
+        self
     }
-    fn set_half_carry(&mut self, value: bool) {
+    fn set_half_carry(&mut self, value: bool) -> &mut Self {
         self.0 |= u8::from(value) << 5;
+        self
     }
-    fn set_carry(&mut self, value: bool) {
+    fn set_carry(&mut self, value: bool) -> &mut Self {
         self.0 |= u8::from(value) << 4;
+        self
     }
 }
 
@@ -198,19 +202,19 @@ enum Operation {
     Inc(Target),
     Dec(Target),
     Stop,
-    JumpRelative(i8),
+    JumpRelative(Condition, i8),
     RotateAccumulator(RotationType, Direction),
     ComplementCarry,
     SetCarry,
     ComplementAccumulator,
     DecimalAdjustAccumulator,
-    Compare(Target, Target),
-    Or(Target, Target),
-    Xor(Target, Target),
-    And(Target, Target),
-    Sbc(Target, Target),
-    Sub(Target, Target),
-    Adc(Target, Target),
+    Compare(Target),
+    Or(Target),
+    Xor(Target),
+    And(Target),
+    Sbc(Target),
+    Sub(Target),
+    Adc(Target),
     Add(Target, Target),
     Return(Condition),
     Push(Registers16),
@@ -250,6 +254,7 @@ enum Registers16 {
     SP,
     AF,
 }
+#[derive(Debug, Clone, Copy)]
 
 enum Indirect {
     R16(Registers16),
@@ -266,6 +271,7 @@ enum Target {
     Imm16(u16),
     Ind(Indirect),
 }
+#[derive(Debug, Clone, Copy)]
 
 enum Condition {
     None,
@@ -274,11 +280,13 @@ enum Condition {
     NC,
     C,
 }
+#[derive(Debug, Clone, Copy)]
 
 enum RotationType {
     Circular,
     NonCircular,
 }
+#[derive(Debug, Clone, Copy)]
 
 enum Direction {
     Left,
@@ -378,10 +386,13 @@ struct CPU {
     pc: u16,
     memory: MemoryBus,
     ir: u8,
+    ime: bool,
 }
 
 impl CPU {
-    fn tick(&mut self) {
+    fn tick(&mut self) {}
+    fn tick_and_increment_pc(&mut self) {
+        self.tick();
         self.pc = self.pc.wrapping_add(1);
     }
 
@@ -393,10 +404,10 @@ impl CPU {
             // https://gbdev.io/gb-opcodes/optables/octal
             (0o0, 0o0, 0o0) => Operation::Nop,
             (0o0, 0o1, 0o0) => {
-                self.tick();
                 let lsb = self.memory.read_u8(self.pc);
-                self.tick();
+                self.tick_and_increment_pc();
                 let msb = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
                 Operation::Load(
                     Ind(Indirect::Imm16(u16::from_le_bytes([lsb, msb]))),
                     R16(SP),
@@ -413,9 +424,10 @@ impl CPU {
                     0o7 => C,
                     _ => unreachable!(),
                 };
-                self.tick();
+
                 let offset = self.memory.read_u8(self.pc) as i8;
-                Operation::JumpRelative(offset)
+                self.tick_and_increment_pc();
+                Operation::JumpRelative(condition, offset)
             }
             (0o0, op, 0o1) => {
                 let target = match op >> 1 {
@@ -426,10 +438,10 @@ impl CPU {
                     _ => unreachable!(),
                 };
                 if op & 0b1 == 0 {
-                    self.tick();
                     let lsb = self.memory.read_u8(self.pc);
-                    self.tick();
+                    self.tick_and_increment_pc();
                     let msb = self.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc();
                     Operation::Load(R16(target), Imm16(u16::from_le_bytes([lsb, msb])))
                 } else {
                     Operation::Add(R16(HL), R16(target))
@@ -503,8 +515,8 @@ impl CPU {
                     0o7 => R8(A),
                     _ => unreachable!(),
                 };
-                self.tick();
                 let value = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
                 Operation::Load(destination, Imm8(value))
             }
             (0o0, op @ 0o0..=0o3, 0o7) => {
@@ -565,13 +577,13 @@ impl CPU {
                 };
                 match op {
                     0 => Operation::Add(R8(A), target),
-                    1 => Operation::Adc(R8(A), target),
-                    2 => Operation::Sub(R8(A), target),
-                    3 => Operation::Sbc(R8(A), target),
-                    4 => Operation::And(R8(A), target),
-                    5 => Operation::Xor(R8(A), target),
-                    6 => Operation::Or(R8(A), target),
-                    7 => Operation::Compare(R8(A), target),
+                    1 => Operation::Adc(target),
+                    2 => Operation::Sub(target),
+                    3 => Operation::Sbc(target),
+                    4 => Operation::And(target),
+                    5 => Operation::Xor(target),
+                    6 => Operation::Or(target),
+                    7 => Operation::Compare(target),
                     _ => unreachable!(),
                 }
             }
@@ -587,8 +599,8 @@ impl CPU {
                 Operation::Return(condition)
             }
             (0o3, kind @ (0o4 | 0o6), 0o0) => {
-                self.tick();
                 let offset = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
                 let address = u16::from_le_bytes([offset, 0xFF]);
                 match kind {
                     0o4 => Operation::Load(Ind(Indirect::Imm16(address)), R8(A)),
@@ -597,13 +609,13 @@ impl CPU {
                 }
             }
             (0o3, 0o5, 0o0) => {
-                self.tick();
                 let offset = self.memory.read_u8(self.pc) as i8;
+                self.tick_and_increment_pc();
                 Operation::AddStack(offset)
             }
             (0o3, 0o7, 0o0) => {
-                self.tick();
                 let offset = self.memory.read_u8(self.pc) as i8;
+                self.tick_and_increment_pc();
                 Operation::LoadStackOffset(offset)
             }
             (0o3, 0o7, 0o1) => Operation::Load(R16(SP), R16(HL)),
@@ -633,10 +645,10 @@ impl CPU {
                     0o3 => C,
                     _ => unreachable!(),
                 };
-                self.tick();
                 let lsb = self.memory.read_u8(self.pc);
-                self.tick();
+                self.tick_and_increment_pc();
                 let msb = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
                 let address = u16::from_le_bytes([lsb, msb]);
                 Operation::Jump(condition, Imm16(address))
             }
@@ -644,10 +656,10 @@ impl CPU {
                 let dest = if op & 1 == 0 {
                     Ind(Indirect::C)
                 } else {
-                    self.tick();
                     let lsb = self.memory.read_u8(self.pc);
-                    self.tick();
+                    self.tick_and_increment_pc();
                     let msb = self.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc();
                     let address = u16::from_le_bytes([lsb, msb]);
                     Ind(Indirect::Imm16(address))
                 };
@@ -659,17 +671,14 @@ impl CPU {
                 }
             }
             (0o3, 0o0, 0o3) => {
-                self.tick();
                 let lsb = self.memory.read_u8(self.pc);
-                self.tick();
+                self.tick_and_increment_pc();
                 let msb = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
                 let address = u16::from_le_bytes([lsb, msb]);
                 Operation::Jump(Condition::None, Imm16(address))
             }
-            (0o3, 0o1, 0o3) => {
-                self.tick();
-                self.fetch_cb_operation()
-            }
+            (0o3, 0o1, 0o3) => self.fetch_cb_operation(),
             (0o3, 0o2..=0o5, 0o3) => {
                 error!("Invalid opcode");
                 todo!("Decide what to do on invalid opcode")
@@ -685,10 +694,10 @@ impl CPU {
                     0o3 => C,
                     _ => unreachable!(),
                 };
-                self.tick();
                 let lsb = self.memory.read_u8(self.pc);
-                self.tick();
+                self.tick_and_increment_pc();
                 let msb = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
                 let address = u16::from_le_bytes([lsb, msb]);
                 Operation::Call(condition, Imm16(address))
             }
@@ -697,10 +706,10 @@ impl CPU {
                 todo!("Decide what to do on invalid opcode")
             }
             (0o3, 0o1, 0o5) => {
-                self.tick();
                 let lsb = self.memory.read_u8(self.pc);
-                self.tick();
+                self.tick_and_increment_pc();
                 let msb = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
                 let address = u16::from_le_bytes([lsb, msb]);
                 Operation::Call(Condition::None, Imm16(address))
             }
@@ -709,11 +718,11 @@ impl CPU {
                 todo!("Decide what to do on invalid opcode")
             }
             (0o3, kind @ 0o0..=0o7, 0o6) => {
-                self.tick();
                 let value = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
                 let dest = R8(A);
                 let operation = match kind {
-                    0o0 => Operation::Add,
+                    0o0 => |value| Operation::Add(R8(A), value),
                     0o1 => Operation::Adc,
                     0o2 => Operation::Sub,
                     0o3 => Operation::Sbc,
@@ -723,7 +732,7 @@ impl CPU {
                     0o7 => Operation::Compare,
                     _ => unreachable!(),
                 };
-                operation(dest, Target::Imm8(value))
+                operation(Target::Imm8(value))
             }
             (0o3, variant @ 0o0..=0o7, 0o7) => {
                 let lsb = match variant {
@@ -744,11 +753,12 @@ impl CPU {
         };
     }
 
-    fn fetch_cb_operation(&self) -> Operation {
+    fn fetch_cb_operation(&mut self) -> Operation {
         use Registers8::*;
         use Registers16::*;
         use Target::*;
         let (operation, target) = decompose_octal_cb(self.memory.read_u8(self.pc));
+        self.tick_and_increment_pc();
 
         let target = match target {
             0o0 => R8(B),
@@ -781,37 +791,403 @@ impl CPU {
 
     fn execute_operation(&mut self, operation: Operation) {
         match operation {
-            Operation::Nop => todo!(),
-            Operation::Halt => todo!(),
-            Operation::Load(target, target1) => todo!(),
-            Operation::Inc(target) => todo!(),
-            Operation::Dec(target) => todo!(),
-            Operation::Stop => todo!(),
-            Operation::JumpRelative(_) => todo!(),
-            Operation::RotateAccumulator(rotation_type, direction) => todo!(),
-            Operation::ComplementCarry => todo!(),
-            Operation::SetCarry => todo!(),
-            Operation::ComplementAccumulator => todo!(),
-            Operation::DecimalAdjustAccumulator => todo!(),
-            Operation::Compare(target, target1) => todo!(),
-            Operation::Or(target, target1) => todo!(),
-            Operation::Xor(target, target1) => todo!(),
-            Operation::And(target, target1) => todo!(),
-            Operation::Sbc(target, target1) => todo!(),
-            Operation::Sub(target, target1) => todo!(),
-            Operation::Adc(target, target1) => todo!(),
-            Operation::Add(destination, source) => todo!(),
-            Operation::Return(condition) => todo!(),
-            Operation::Push(registers16) => todo!(),
-            Operation::Pop(registers16) => todo!(),
-            Operation::ReturnInterrupt => todo!(),
-            Operation::Jump(condition, target) => todo!(),
-            Operation::AddStack(_) => todo!(),
-            Operation::LoadStackOffset(_) => todo!(),
-            Operation::DisableInterrupt => todo!(),
-            Operation::EnableInterrupt => todo!(),
-            Operation::Call(condition, target) => todo!(),
-            Operation::Restart(_) => todo!(),
+            Operation::Nop => {}
+            Operation::Halt => self.halt(),
+            Operation::Load(destination, source) => self.load(destination, source),
+            Operation::Inc(target) => self.increment(target),
+            Operation::Dec(target) => self.decrement(target),
+            Operation::Stop => self.stop(),
+            Operation::Jump(condition, target) => self.jump(condition, target),
+            Operation::JumpRelative(condition, offset) => self.jump_relative(condition, offset),
+            Operation::RotateAccumulator(rotation_type, direction) => {
+                self.rotate_accumulator(rotation_type, direction)
+            }
+            Operation::ComplementCarry => {
+                let new_carry = !self.registers.f.carry();
+                self.registers
+                    .f
+                    .set_subtract(false)
+                    .set_half_carry(false)
+                    .set_carry(new_carry);
+            }
+            Operation::SetCarry => {
+                self.registers
+                    .f
+                    .set_subtract(false)
+                    .set_half_carry(false)
+                    .set_carry(true);
+            }
+            Operation::ComplementAccumulator => {
+                self.registers.a = !self.registers.a;
+                self.registers.f.set_subtract(true).set_half_carry(true);
+            }
+            Operation::DecimalAdjustAccumulator => {
+                let mut adjustment = 0u8;
+                if self.registers.f.subtract() {
+                    if self.registers.f.half_carry() {
+                        adjustment = adjustment.wrapping_add(0x6);
+                    }
+                    if self.registers.f.carry() {
+                        adjustment = adjustment.wrapping_add(0x60);
+                    }
+                    self.registers.a = self.registers.a.wrapping_sub(adjustment);
+                } else {
+                    if self.registers.f.half_carry() || self.registers.a & 0xF > 0x9 {
+                        adjustment = adjustment.wrapping_add(0x6);
+                    }
+                    if self.registers.f.carry() || self.registers.a > 0x99 {
+                        adjustment = adjustment.wrapping_add(0x60);
+                        self.registers.f.set_carry(true);
+                    }
+                    self.registers.a = self.registers.a.wrapping_add(adjustment);
+                }
+                self.registers
+                    .f
+                    .set_zero(self.registers.a == 0)
+                    .set_half_carry(false);
+            }
+            Operation::Compare(target) => {
+                let value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Imm8(value) => value,
+                    Target::Ind(Indirect::R16(register)) => {
+                        let value = self.memory.read_u8(self.read_register16(register));
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid targets for operation"),
+                };
+                let (result, carry) = self.registers.a.overflowing_sub(value);
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(true)
+                    .set_half_carry(
+                        (self.registers.a & 0xF).wrapping_sub(value & 0xF) & 0x10 == 0x10,
+                    )
+                    .set_carry(carry);
+            }
+            Operation::Or(target) => {
+                let value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Imm8(value) => value,
+                    Target::Ind(Indirect::R16(register)) => {
+                        let value = self.memory.read_u8(self.read_register16(register));
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid targets for operation"),
+                };
+                let result = self.registers.a | value;
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(false)
+                    .set_half_carry(false)
+                    .set_carry(false);
+                self.registers.a = result;
+            }
+            Operation::Xor(target) => {
+                let value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Imm8(value) => value,
+                    Target::Ind(Indirect::R16(register)) => {
+                        let value = self.memory.read_u8(self.read_register16(register));
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid targets for operation"),
+                };
+                let result = self.registers.a ^ value;
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(false)
+                    .set_half_carry(false)
+                    .set_carry(false);
+                self.registers.a = result;
+            }
+            Operation::And(target) => {
+                let value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Imm8(value) => value,
+                    Target::Ind(Indirect::R16(register)) => {
+                        let value = self.memory.read_u8(self.read_register16(register));
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid targets for operation"),
+                };
+                let result = self.registers.a & value;
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(false)
+                    .set_half_carry(false)
+                    .set_carry(false);
+                self.registers.a = result;
+            }
+            Operation::Sbc(target) => {
+                let value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Imm8(value) => value,
+                    Target::Ind(Indirect::R16(register)) => {
+                        let value = self.memory.read_u8(self.read_register16(register));
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid targets for operation"),
+                };
+                let incoming_carry = self.registers.f.carry() as u8;
+                let (result, carry1) = self.registers.a.overflowing_sub(value);
+                let (result, carry2) = result.overflowing_sub(incoming_carry);
+
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(true)
+                    .set_half_carry(
+                        (self.registers.a & 0xF)
+                            .wrapping_sub(value & 0xF)
+                            .wrapping_sub(incoming_carry & 0xF)
+                            & 0x10
+                            == 0x10,
+                    )
+                    .set_carry(carry1 || carry2);
+                self.registers.a = result;
+            }
+            Operation::Sub(target) => {
+                let value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Imm8(value) => value,
+                    Target::Ind(Indirect::R16(register)) => {
+                        let value = self.memory.read_u8(self.read_register16(register));
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid targets for operation"),
+                };
+                let (result, carry) = self.registers.a.overflowing_sub(value);
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(true)
+                    .set_half_carry(
+                        (self.registers.a & 0xF).wrapping_sub(value & 0xF) & 0x10 == 0x10,
+                    )
+                    .set_carry(carry);
+                self.registers.a = result;
+            }
+            Operation::Adc(target) => {
+                let value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Imm8(value) => value,
+                    Target::Ind(Indirect::R16(register)) => {
+                        let value = self.memory.read_u8(self.read_register16(register));
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid targets for operation"),
+                };
+                let incoming_carry = self.registers.f.carry() as u8;
+                let (result, carry1) = self.registers.a.overflowing_add(value);
+                let (result, carry2) = result.overflowing_add(incoming_carry);
+
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(false)
+                    .set_half_carry(
+                        (self.registers.a & 0xF)
+                            .wrapping_add(value & 0xF)
+                            .wrapping_add(incoming_carry & 0xF)
+                            & 0x10
+                            == 0x10,
+                    )
+                    .set_carry(carry1 || carry2);
+                self.registers.a = result;
+            }
+            Operation::Add(destination, source) => match destination {
+                Target::R8(Registers8::A) => {
+                    let value = match source {
+                        Target::R8(register) => self.read_register8(register),
+                        Target::Imm8(value) => value,
+                        Target::Ind(Indirect::R16(register)) => {
+                            let value = self.memory.read_u8(self.read_register16(register));
+                            self.tick();
+                            value
+                        }
+                        _ => unimplemented!("Invalid targets for operation"),
+                    };
+                    let incoming_carry = self.registers.f.carry() as u8;
+                    let (result, carry1) = self.registers.a.overflowing_sub(value);
+                    let (result, carry2) = result.overflowing_sub(incoming_carry);
+
+                    self.registers
+                        .f
+                        .set_zero(result == 0)
+                        .set_subtract(true)
+                        .set_half_carry(
+                            (self.registers.a & 0xF)
+                                .wrapping_sub(value & 0xF)
+                                .wrapping_sub(incoming_carry & 0xF)
+                                & 0x10
+                                == 0x10,
+                        )
+                        .set_carry(carry1 || carry2);
+                    self.registers.a = result;
+                }
+                Target::R16(Registers16::HL) => match source {
+                    Target::R16(register) => {
+                        let (l, r) = (self.registers.hl(), self.read_register16(register));
+                        let (result, carry) = l.overflowing_add(r);
+                        let quarter_carry = ((l & 0xF) + (r & 0xF)) & 0x10 == 0x10;
+                        let half_carry = ((l & 0xFF) + (r & 0xFF)) & 0x100 == 0x100;
+                        let three_quarter_carry = ((l & 0xFFF) + (r & 0xFFF)) & 0x1000 == 0x1000;
+                        let [lsb, msb] = result.to_le_bytes();
+                        self.registers.l = lsb;
+                        self.registers
+                            .f
+                            .set_subtract(false)
+                            .set_half_carry(quarter_carry)
+                            .set_carry(half_carry);
+                        self.tick();
+                        self.registers.h = msb;
+                        self.registers
+                            .f
+                            .set_subtract(false)
+                            .set_half_carry(three_quarter_carry)
+                            .set_carry(carry);
+                    }
+                    _ => unimplemented!("Invalid operation"),
+                },
+                _ => unimplemented!("Invalid operation"),
+            },
+            Operation::Return(condition) => {
+                let condition_met = match condition {
+                    Condition::None => true,
+                    Condition::NZ => !self.registers.f.zero(),
+                    Condition::Z => self.registers.f.zero(),
+                    Condition::NC => !self.registers.f.carry(),
+                    Condition::C => self.registers.f.carry(),
+                };
+                if condition_met {
+                    if !matches!(condition, Condition::None) {
+                        self.tick()
+                    };
+                    let lsb = self.memory.read_u8(self.registers.sp);
+                    self.registers.sp = self.registers.sp.wrapping_add(1);
+                    self.tick();
+                    let msb = self.memory.read_u8(self.registers.sp);
+                    self.registers.sp = self.registers.sp.wrapping_add(1);
+                    self.tick();
+                    self.pc = u16::from_le_bytes([lsb, msb]);
+                }
+                self.tick();
+            }
+            Operation::Push(register) => {
+                let [lsb, msb] = self.read_register16(register).to_le_bytes();
+                self.registers.sp = self.registers.sp.wrapping_sub(1);
+                self.tick();
+                self.memory.set_u8(self.registers.sp, msb);
+                self.registers.sp = self.registers.sp.wrapping_sub(1);
+                self.tick();
+                self.memory.set_u8(self.registers.sp, lsb);
+                self.tick();
+            }
+            Operation::Pop(register) => {
+                let lsb = self.memory.read_u8(self.registers.sp);
+                self.registers.sp = self.registers.sp.wrapping_add(1);
+                self.tick();
+                let msb = self.memory.read_u8(self.registers.sp);
+                self.registers.sp = self.registers.sp.wrapping_add(1);
+                self.tick();
+                self.set_register16(register, u16::from_le_bytes([lsb, msb]));
+            }
+            Operation::ReturnInterrupt => {
+                self.tick();
+                let lsb = self.memory.read_u8(self.registers.sp);
+                self.registers.sp = self.registers.sp.wrapping_add(1);
+                self.tick();
+                let msb = self.memory.read_u8(self.registers.sp);
+                self.registers.sp = self.registers.sp.wrapping_add(1);
+                self.tick();
+                self.pc = u16::from_le_bytes([lsb, msb]);
+                self.ime = true;
+                self.tick();
+            }
+            Operation::AddStack(offset) => {
+                let [lsb, msb] = self.registers.sp.to_le_bytes();
+                let (result_lsb, carry) = lsb.overflowing_add(offset as u8);
+                self.registers
+                    .f
+                    .set_zero(false)
+                    .set_subtract(false)
+                    .set_half_carry((lsb & 0xF).wrapping_add(offset as u8 & 0xF) & 0x10 == 0x10)
+                    .set_carry(carry);
+                let z_sign = (result_lsb >> 7) & 0b1 == 0b1;
+                self.tick();
+                let adjustment = if z_sign { 0xFF } else { 0x00 };
+                let result_msb = msb.wrapping_add(adjustment).wrapping_add(carry.into());
+                self.tick();
+                self.registers.sp = u16::from_le_bytes([result_lsb, result_msb]);
+            }
+            Operation::LoadStackOffset(offset) => {
+                let [lsb, msb] = self.registers.sp.to_le_bytes();
+                let (result_lsb, carry) = lsb.overflowing_add(offset as u8);
+                self.registers.l = result_lsb;
+                self.registers
+                    .f
+                    .set_zero(false)
+                    .set_subtract(false)
+                    .set_half_carry((lsb & 0xF).wrapping_add(offset as u8 & 0xF) & 0x10 == 0x10)
+                    .set_carry(carry);
+                let z_sign = (result_lsb >> 7) & 0b1 == 0b1;
+                self.tick();
+                let adjustment = if z_sign { 0xFF } else { 0x00 };
+                let result_msb = msb
+                    .wrapping_add(adjustment)
+                    .wrapping_add(self.registers.f.carry().into());
+                self.registers.h = result_msb;
+            }
+            Operation::DisableInterrupt => {
+                self.ime = false;
+            }
+            Operation::EnableInterrupt => {
+                self.ime = true;
+            }
+            Operation::Call(condition, target) => {
+                let condition_met = match condition {
+                    Condition::None => true,
+                    Condition::NZ => !self.registers.f.zero(),
+                    Condition::Z => self.registers.f.zero(),
+                    Condition::NC => !self.registers.f.carry(),
+                    Condition::C => self.registers.f.carry(),
+                };
+                let [lsb, msb] = self.pc.to_le_bytes();
+                self.registers.sp = self.registers.sp.wrapping_sub(1);
+                self.tick();
+                self.memory.set_u8(self.registers.sp, msb);
+                self.registers.sp = self.registers.sp.wrapping_sub(1);
+                self.tick();
+                self.memory.set_u8(self.registers.sp, lsb);
+                let Target::Imm16(address) = target else {
+                    unimplemented!("Invalid target for operation");
+                };
+                self.pc = address;
+                self.tick();
+            }
+            Operation::Restart(address) => {
+                let [lsb, msb] = self.pc.to_le_bytes();
+                self.registers.sp = self.registers.sp.wrapping_sub(1);
+                self.tick();
+                self.memory.set_u8(self.registers.sp, msb);
+                self.registers.sp = self.registers.sp.wrapping_sub(1);
+                self.tick();
+                self.memory.set_u8(self.registers.sp, lsb);
+                self.pc = address;
+                self.tick();
+            }
             Operation::Rotate(rotation_type, direction, target) => todo!(),
             Operation::ShiftArithmetic(direction, target) => todo!(),
             Operation::Swap(target) => todo!(),
@@ -820,6 +1196,318 @@ impl CPU {
             Operation::ResetBit(_, target) => todo!(),
             Operation::SetBit(_, target) => todo!(),
         }
+    }
+
+    fn halt(&self) {
+        todo!()
+    }
+
+    fn load(&mut self, destination: Target, source: Target) {
+        match source {
+            Target::R8(register) => self.load8(destination, self.read_register8(register)),
+            Target::Imm8(value) => self.load8(destination, value),
+            Target::R16(register) => self.load16(destination, self.read_register16(register)),
+            Target::Imm16(value) => self.load16(destination, value),
+            Target::Ind(indirect) => match indirect {
+                Indirect::R16(register) => {
+                    self.tick();
+                    let value = self.memory.read_u8(self.read_register16(register));
+                    self.load8(destination, value)
+                }
+                Indirect::Imm16(value) => {
+                    self.tick();
+                    let value = self.memory.read_u8(value);
+                    self.load8(destination, value)
+                }
+                Indirect::HLI => {
+                    self.tick();
+                    let value = self.memory.read_u8(self.registers.hl());
+                    self.registers.set_hl(self.registers.hl().wrapping_add(1));
+                    self.load8(destination, value)
+                }
+                Indirect::HLD => {
+                    self.tick();
+                    let value = self.memory.read_u8(self.registers.hl());
+                    self.registers.set_hl(self.registers.hl().wrapping_sub(1));
+                    self.load8(destination, value)
+                }
+                Indirect::C => {
+                    self.tick();
+                    let value = self
+                        .memory
+                        .read_u8(u16::from_le_bytes([self.registers.c, 0xFF]));
+                    self.load8(destination, value)
+                }
+            },
+        };
+    }
+    fn load8(&mut self, destination: Target, value: u8) {
+        match destination {
+            Target::R8(register) => {
+                self.set_register8(register, value);
+            }
+            Target::R16(_) => unimplemented!("Invalid 8-bit load to 16-bit register"),
+            Target::Imm8(_) => unimplemented!("Invalid 8-bit load to immediate value"),
+            Target::Imm16(_) => unimplemented!("Invalid 8-bit load to immediate value"),
+            Target::Ind(indirect) => match indirect {
+                Indirect::R16(register) => {
+                    self.memory.set_u8(self.read_register16(register), value);
+                    self.tick();
+                }
+                Indirect::Imm16(address) => {
+                    self.memory.set_u8(address, value);
+                    self.tick();
+                }
+                Indirect::HLI => {
+                    self.memory.set_u8(self.registers.hl(), value);
+                    self.registers.set_hl(self.registers.hl().wrapping_add(1));
+                    self.tick();
+                }
+                Indirect::HLD => {
+                    self.memory.set_u8(self.registers.hl(), value);
+                    self.registers.set_hl(self.registers.hl().wrapping_sub(1));
+                    self.tick();
+                }
+                Indirect::C => {
+                    let addr = u16::from_le_bytes([self.registers.c, 0xFF]);
+                    self.memory.set_u8(addr, value);
+                    self.tick();
+                }
+            },
+        }
+    }
+
+    fn load16(&mut self, destination: Target, value: u16) {
+        match destination {
+            Target::R8(_) => unimplemented!("Invalid 16-bit write to 8-bit register"),
+            Target::R16(register) => {
+                self.set_register16(register, value);
+            }
+            Target::Imm8(_) => unimplemented!("Invalid write to immediate"),
+            Target::Imm16(_) => unimplemented!("Invalid write to immediate"),
+            Target::Ind(indirect) => match indirect {
+                Indirect::R16(_) => unimplemented!("No indirect 16-bit writes to registers"),
+                Indirect::Imm16(address) => {
+                    let [lsb, msb] = address.to_le_bytes();
+                    self.memory.set_u8(address, lsb);
+                    self.tick();
+                    self.memory.set_u8(address.wrapping_add(1), msb);
+                    self.tick()
+                }
+                _ => unimplemented!("Invalid 16-bit write requested"),
+            },
+        }
+    }
+
+    fn read_register8(&self, register: Registers8) -> u8 {
+        match register {
+            Registers8::A => self.registers.a,
+            Registers8::B => self.registers.b,
+            Registers8::C => self.registers.c,
+            Registers8::D => self.registers.d,
+            Registers8::E => self.registers.e,
+            Registers8::H => self.registers.h,
+            Registers8::L => self.registers.l,
+        }
+    }
+
+    fn read_register16(&self, register: Registers16) -> u16 {
+        match register {
+            Registers16::BC => self.registers.bc(),
+            Registers16::DE => self.registers.de(),
+            Registers16::HL => self.registers.hl(),
+            Registers16::SP => self.registers.sp,
+            Registers16::AF => self.registers.af(),
+        }
+    }
+    fn set_register16(&mut self, register: Registers16, value: u16) {
+        match register {
+            Registers16::BC => self.registers.set_bc(value),
+            Registers16::DE => self.registers.set_de(value),
+            Registers16::HL => self.registers.set_hl(value),
+            Registers16::SP => self.registers.sp = value,
+            Registers16::AF => self.registers.set_af(value),
+        }
+    }
+
+    fn set_register8(&mut self, register: Registers8, value: u8) {
+        match register {
+            Registers8::A => self.registers.a == value,
+            Registers8::B => self.registers.b == value,
+            Registers8::C => self.registers.c == value,
+            Registers8::D => self.registers.d == value,
+            Registers8::E => self.registers.e == value,
+            Registers8::H => self.registers.h == value,
+            Registers8::L => self.registers.l == value,
+        };
+    }
+
+    fn increment(&mut self, target: Target) {
+        match target {
+            Target::R8(register) => {
+                let current = self.read_register8(register);
+                let (result, _carry) = current.overflowing_add(1);
+                let half_carry = current & 0x0F == 0x0F;
+                self.set_register8(register, result);
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(false)
+                    .set_half_carry(half_carry);
+            }
+            Target::R16(register) => {
+                self.set_register16(register, self.read_register16(register).wrapping_add(1));
+                self.tick();
+            }
+            Target::Ind(indirect) => match indirect {
+                Indirect::R16(register) => {
+                    let address = self.read_register16(register);
+                    let value = self.memory.read_u8(address);
+                    self.tick();
+                    let (result, _carry) = value.overflowing_add(1);
+                    let half_carry = value & 0x0F == 0x0F;
+                    self.memory.set_u8(address, result);
+                    self.registers
+                        .f
+                        .set_zero(result == 0)
+                        .set_subtract(false)
+                        .set_half_carry(half_carry);
+                    self.tick();
+                }
+                _ => unimplemented!("Invalid target for operation"),
+            },
+            _ => unimplemented!("Invalid target for operation"),
+        }
+    }
+
+    fn decrement(&mut self, target: Target) {
+        match target {
+            Target::R8(register) => {
+                let current = self.read_register8(register);
+                let result = current.wrapping_sub(1);
+                let half_carry = current & 0x0F == 0;
+                self.set_register8(register, result);
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(true)
+                    .set_half_carry(half_carry);
+            }
+            Target::R16(register) => {
+                self.set_register16(register, self.read_register16(register).wrapping_sub(1));
+                self.tick();
+            }
+            Target::Ind(indirect) => match indirect {
+                Indirect::R16(register) => {
+                    let address = self.read_register16(register);
+                    let value = self.memory.read_u8(address);
+                    self.tick();
+                    let result = value.wrapping_sub(1);
+                    let half_carry = value & 0x0F == 0;
+                    self.memory.set_u8(address, result);
+                    self.registers
+                        .f
+                        .set_zero(result == 0)
+                        .set_subtract(true)
+                        .set_half_carry(half_carry);
+                    self.tick();
+                }
+                _ => unimplemented!("Invalid target for operation"),
+            },
+            _ => unimplemented!("Invalid target for operation"),
+        }
+    }
+
+    fn stop(&self) {
+        todo!()
+    }
+
+    fn jump(&mut self, condition: Condition, target: Target) {
+        match target {
+            Target::R16(register) => self.pc = self.read_register16(register),
+            Target::Imm16(address) => match condition {
+                Condition::None => {
+                    self.pc = address;
+                    self.tick();
+                }
+                Condition::NZ => {
+                    if !self.registers.f.zero() {
+                        self.pc = address;
+                        self.tick();
+                    }
+                }
+                Condition::Z => {
+                    if self.registers.f.zero() {
+                        self.pc = address;
+                        self.tick();
+                    }
+                }
+                Condition::NC => {
+                    if !self.registers.f.carry() {
+                        self.pc = address;
+                        self.tick();
+                    }
+                }
+                Condition::C => {
+                    if self.registers.f.carry() {
+                        self.pc = address;
+                        self.tick();
+                    }
+                }
+            },
+            _ => unimplemented!("Invalid target for operation"),
+        }
+    }
+
+    fn jump_relative(&mut self, condition: Condition, offset: i8) {
+        let condition_met = match condition {
+            Condition::None => true,
+            Condition::NZ => !self.registers.f.zero(),
+            Condition::Z => self.registers.f.zero(),
+            Condition::NC => !self.registers.f.carry(),
+            Condition::C => self.registers.f.carry(),
+        };
+        if condition_met {
+            self.tick();
+            let result = self.pc.wrapping_add_signed(offset as i16);
+            self.tick();
+            self.pc = result;
+        }
+        self.tick();
+    }
+
+    fn rotate_accumulator(&mut self, rotation_type: RotationType, direction: Direction) {
+        let (result, carry) = match (rotation_type, direction) {
+            (RotationType::Circular, Direction::Left) => {
+                let b7 = (self.registers.a >> 7) & 0b1 == 1;
+                (self.registers.a.rotate_left(1), b7)
+            }
+            (RotationType::Circular, Direction::Right) => {
+                let b0 = self.registers.a & 0b1 == 1;
+                (self.registers.a.rotate_right(1), b0)
+            }
+            (RotationType::NonCircular, Direction::Left) => {
+                let b7 = (self.registers.a >> 7) & 0b1 == 1;
+                (
+                    self.registers.a.shl(1) | self.registers.f.carry().conv::<u8>(),
+                    b7,
+                )
+            }
+            (RotationType::NonCircular, Direction::Right) => {
+                let b0 = (self.registers.a >> 7) & 0b1 == 1;
+                (
+                    self.registers.a.shr(1) | (self.registers.f.carry().conv::<u8>() << 7),
+                    b0,
+                )
+            }
+        };
+        self.registers.a = result;
+        self.registers
+            .f
+            .set_zero(false)
+            .set_subtract(false)
+            .set_half_carry(false)
+            .set_carry(carry);
     }
 }
 
