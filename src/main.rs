@@ -1,6 +1,7 @@
+#![allow(unused, clippy::upper_case_acronyms)]
+
 use better_default::Default;
 use core::ops::{Deref, DerefMut, Shl, Shr};
-use tracing::error;
 
 use bytes::BytesMut;
 use iced::widget::{column, *};
@@ -9,9 +10,30 @@ use iced::{
     Length::Fill,
     widget::canvas::{Cache, Canvas, Image},
 };
+use tracing::{debug, error, info};
+use tracing_subscriber::{EnvFilter, fmt};
+
 use tap::{Conv, Pipe, Tap};
 fn main() -> iced::Result {
-    iced::run(update, view)
+    let format = fmt::format()
+        .with_level(false) // don't include levels in formatted output
+        .with_target(false) // don't include targets
+        .without_time()
+        .compact();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .event_format(format)
+        .init();
+
+    let mut cpu = CPU::default();
+    cpu.load_debug_initial_state();
+    cpu.load_rom(include_bytes!(
+        "../test_roms/cpu_instrs/individual/01-special.gb"
+    ));
+    cpu.run();
+    //iced::run(update, view)
+    Ok(())
 }
 
 fn update(state: &mut State, message: Message) {}
@@ -42,7 +64,7 @@ impl Default for Buffer {
         }
 
         Self {
-            buffer: buffer,
+            buffer,
             cache: Cache::default(),
         }
     }
@@ -159,36 +181,40 @@ impl FlagsRegister {
     }
 
     fn set_zero(&mut self, value: bool) -> &mut Self {
+        self.0 &= !(1 << 7);
         self.0 |= u8::from(value) << 7;
         self
     }
     fn set_subtract(&mut self, value: bool) -> &mut Self {
+        self.0 &= !(1 << 6);
         self.0 |= u8::from(value) << 6;
         self
     }
     fn set_half_carry(&mut self, value: bool) -> &mut Self {
+        self.0 &= !(1 << 5);
         self.0 |= u8::from(value) << 5;
         self
     }
     fn set_carry(&mut self, value: bool) -> &mut Self {
+        self.0 &= !(1 << 4);
         self.0 |= u8::from(value) << 4;
         self
     }
 }
 
-impl<'a> From<u8> for FlagsRegister {
+impl From<u8> for FlagsRegister {
     fn from(value: u8) -> Self {
         Self::new(value)
     }
 }
 
-impl<'a> DerefMut for FlagsRegister {
+impl DerefMut for FlagsRegister {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl<'a> Deref for FlagsRegister {
+impl Deref for FlagsRegister {
     type Target = u8;
 
     fn deref(&self) -> &Self::Target {
@@ -264,6 +290,8 @@ enum Indirect {
     C,
 }
 
+#[derive(Debug, Clone)]
+
 enum Target {
     R8(Registers8),
     R16(Registers16),
@@ -315,15 +343,248 @@ struct MemoryBus {
     wram1: Memory4K,
     #[default([0; 1024 * 4])]
     wram2: Memory4K,
-    #[default([0; 0xFFFE-0xFF80])]
-    hram: [u8; 0xFFFE - 0xFF80],
+    io: IoRegisters,
+    #[default([0; 0xFFFF-0xFF80])]
+    hram: [u8; 0xFFFF - 0xFF80],
     ie: u8,
+}
+
+#[derive(Default)]
+struct IoRegisters {
+    joypad: JoypadRegister,
+    serial: SerialTransferRegisters,
+    timer: TimerRegisters,
+    interrupt: Interrupts,
+}
+
+#[derive(Default)]
+struct JoypadRegister;
+
+impl JoypadRegister {
+    fn read(&self) -> u8 {
+        todo!()
+    }
+
+    fn write(&mut self, value: u8) {
+        todo!()
+    }
+}
+
+#[derive(Default)]
+struct SerialTransferRegisters;
+impl SerialTransferRegisters {
+    fn read(&self, address: u8) -> u8 {
+        todo!()
+    }
+
+    fn write(&mut self, address: u8, value: u8) {
+        todo!()
+    }
+}
+
+#[derive(Default)]
+struct TimerRegisters {
+    sc: u16,
+    tima: u8,
+    tma: u8,
+    tac: u8,
+    tima_overflow: Option<u8>,
+    tima_written: bool,
+}
+
+impl TimerRegisters {
+    fn read(&self, address: u8) -> u8 {
+        match address {
+            0x00..=0x03 => unreachable!(),
+            0x04 => (self.sc >> 6) as u8,
+            0x05 => self.tima,
+            0x06 => self.tma,
+            0x07 => self.tac,
+            0x08.. => unreachable!(),
+            _ => todo!(),
+        }
+    }
+
+    fn write(&mut self, address: u8, value: u8) {
+        match address {
+            0x00..=0x03 => unreachable!(),
+            0x04 => {
+                let tac_enable = self.tac >> 2 & 0b1 == 0b1;
+                let selected_bit = match (self.tac & 0b11) {
+                    0b00 => 8,
+                    0b01 => 2,
+                    0b10 => 4,
+                    0b11 => 6,
+                    _ => unreachable!(),
+                };
+                let sc_bit_prev = self.sc >> (selected_bit - 1) & 0b1 == 1;
+                self.sc = 0;
+                if sc_bit_prev && tac_enable {
+                    self.timer_tick();
+                }
+            }
+            0x05 => {
+                self.tima_written = true;
+                self.tima = value;
+            }
+            0x06 => {
+                self.tma = value;
+            }
+            0x07 => {
+                let tac_enable = self.tac >> 2 & 0b1 == 0b1;
+                let selected_bit = match (self.tac & 0b11) {
+                    0b00 => 8,
+                    0b01 => 2,
+                    0b10 => 4,
+                    0b11 => 6,
+                    _ => unreachable!(),
+                };
+                let sc_bit_prev = self.sc >> (selected_bit - 1) & 0b1 == 1;
+                self.tac = value;
+                let selected_bit = match (self.tac & 0b11) {
+                    0b00 => 8,
+                    0b01 => 2,
+                    0b10 => 4,
+                    0b11 => 6,
+                    _ => unreachable!(),
+                };
+                let sc_bit_after = self.sc >> (selected_bit - 1) & 0b1 == 1;
+                if sc_bit_prev && !sc_bit_after && tac_enable {
+                    self.timer_tick();
+                }
+            }
+            0x08.. => unreachable!(),
+        };
+    }
+
+    fn timer_tick(&mut self) {
+        let (result, overflow) = self.tima.overflowing_add(1);
+        if overflow && !self.tima_written {
+            self.tima_overflow = Some(self.tma);
+        }
+    }
+
+    fn clock_tick(&mut self) {
+        let tac_enable = self.tac >> 2 & 0b1 == 0b1;
+        let selected_bit = match (self.tac & 0b11) {
+            0b00 => 8,
+            0b01 => 2,
+            0b10 => 4,
+            0b11 => 6,
+            _ => unreachable!(),
+        };
+        let sc_bit_prev = self.sc >> (selected_bit - 1) & 0b1 == 1;
+        self.sc = self.sc.wrapping_add(1);
+        let sc_bit_new = self.sc >> (selected_bit - 1) & 0b1 == 1;
+        if (sc_bit_prev && !sc_bit_new && tac_enable) {
+            self.timer_tick();
+        }
+    }
+
+    fn handle_overflow(&mut self, tma: u8, interrupts: &mut Interrupts) {
+        self.tima = tma;
+
+        // TODO: Schedule interrupt here
+        interrupts.schedule_interrupt(InterruptType::Timer);
+    }
+}
+
+#[derive(Default)]
+struct Interrupts {
+    interrupt_flag: u8,
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(u8)]
+enum InterruptType {
+    Joypad = 4,
+    Serial = 3,
+    Timer = 2,
+    LCD = 1,
+    VBlank = 0,
+}
+
+impl Interrupts {
+    fn read(&self) -> u8 {
+        self.interrupt_flag
+    }
+    fn write(&mut self, value: u8) {
+        self.interrupt_flag = value;
+    }
+
+    fn schedule_interrupt(&mut self, interrupt: InterruptType) {
+        self.interrupt_flag |= (1 << (interrupt as u8));
+    }
+
+    fn clear_interrupt(&mut self, interrupt: InterruptType) {
+        self.interrupt_flag &= !(1 << (interrupt as u8));
+    }
+}
+
+impl IoRegisters {
+    fn read_u8(&self, address: u8) -> u8 {
+        match address {
+            0x00 => self.joypad.read(),
+            0x01..=0x02 => self.serial.read(address),
+            0x03 => unimplemented!(),
+            0x04..=0x07 => self.timer.read(address),
+            0x08..0x0F => unimplemented!(),
+            0x0F => self.interrupt.read(),
+            0x10..=0x26 => {
+                //TODO: AUDIO
+                0xFF
+            }
+            0x27..0x30 => unimplemented!(),
+            0x30..=0x3F => {
+                //TODO: WAVE PATTERN
+                0xFF
+            }
+            0x40..=0x4B => {
+                //TODO: LCD/OAM
+                0x90
+            }
+
+            0x50 => {
+                // Bootrom bank control, write-only
+                0xFF
+            }
+            _ => unimplemented!("CGB/unused IO address"),
+            0x80.. => unreachable!(),
+        }
+    }
+
+    fn write_u8(&mut self, address: u8, value: u8) {
+        match address {
+            0x00 => self.joypad.write(value),
+            0x01..=0x02 => self.serial.write(address, value),
+            0x03 => unimplemented!(),
+            0x04..=0x07 => self.timer.write(address, value),
+            0x08..0x0F => unimplemented!(),
+            0x0F => self.interrupt.write(value),
+            0x10..=0x26 => {
+                //TODO: AUDIO
+            }
+            0x27..0x30 => unimplemented!(),
+            0x30..=0x3F => {
+                //TODO: WAVE PATTERN
+            }
+            0x40..=0x4B => {
+                //TODO: LCD/OAM
+            }
+
+            0x50 => {
+                // Bootrom bank control, write-only
+            }
+            _ => unimplemented!("CGB/unused IO address"),
+            0x80.. => unreachable!(),
+        }
+    }
 }
 
 impl MemoryBus {
     fn read_u8(&self, address: u16) -> u8 {
         match address {
-            0x0000..=0x3FFF => self.rom[address as usize - 0x0000],
+            0x0000..=0x3FFF => self.rom[address as usize],
             0x4000..=0x7FFF => {
                 // TODO: switchable rom banks
                 self.rom_banks[0][address as usize - 0x4000]
@@ -342,28 +603,26 @@ impl MemoryBus {
             0xFEA0..=0xFEFF => {
                 todo!("Prohibited region, implement undefined behaviour")
             }
-            0xFF00..=0xFF7F => {
-                todo!("IO registers")
-            }
+            0xFF00..=0xFF7F => self.io.read_u8(address as u8),
             0xFF80..=0xFFFE => self.hram[address as usize - 0xFF80],
             0xFFFF => self.ie,
         }
     }
 
     fn set_u8(&mut self, address: u16, value: u8) {
-        *match address {
-            0x0000..=0x3FFF => &mut self.rom[address as usize - 0x0000],
+        match address {
+            0x0000..=0x3FFF => self.rom[address as usize] = value,
             0x4000..=0x7FFF => {
                 // TODO: switchable rom banks
-                &mut self.rom_banks[0][address as usize - 0x4000]
+                self.rom_banks[0][address as usize - 0x4000] = value
             }
-            0x8000..=0x9FFF => &mut self.vram[address as usize - 0x8000],
-            0xA000..=0xBFFF => &mut self.external_ram[address as usize - 0xA000],
-            0xC000..=0xCFFF => &mut self.wram1[address as usize - 0xC000],
-            0xD000..=0xDFFF => &mut self.wram2[address as usize - 0xD000],
+            0x8000..=0x9FFF => self.vram[address as usize - 0x8000] = value,
+            0xA000..=0xBFFF => self.external_ram[address as usize - 0xA000] = value,
+            0xC000..=0xCFFF => self.wram1[address as usize - 0xC000] = value,
+            0xD000..=0xDFFF => self.wram2[address as usize - 0xD000] = value,
             0xE000..=0xFDFF => {
                 //Echo RAM
-                &mut self.wram1[address as usize - 0xE000]
+                self.wram1[address as usize - 0xE000] = value
             }
             0xFE00..=0xFE9F => {
                 todo!("Implement OAM")
@@ -372,11 +631,11 @@ impl MemoryBus {
                 todo!("Prohibited region, implement undefined behaviour")
             }
             0xFF00..=0xFF7F => {
-                todo!("IO registers")
+                self.io.write_u8(address as u8, value);
             }
-            0xFF80..=0xFFFE => &mut self.hram[address as usize - 0xFF80],
-            0xFFFF => &mut self.ie,
-        } = value;
+            0xFF80..=0xFFFE => self.hram[address as usize - 0xFF80] = value,
+            0xFFFF => self.ie = value,
+        }
     }
 }
 
@@ -387,20 +646,147 @@ struct CPU {
     memory: MemoryBus,
     ir: u8,
     ime: bool,
+    halted: bool,
 }
 
 impl CPU {
-    fn tick(&mut self) {}
+    fn tick(&mut self) {
+        self.memory.io.timer.tima_written = false;
+        let tima_overflow = self.memory.io.timer.tima_overflow;
+        self.memory.io.timer.tima_overflow = None;
+        self.memory.io.timer.clock_tick();
+        if let Some(tma) = tima_overflow {
+            self.memory
+                .io
+                .timer
+                .handle_overflow(tma, &mut self.memory.io.interrupt);
+        }
+    }
     fn tick_and_increment_pc(&mut self) {
         self.tick();
         self.pc = self.pc.wrapping_add(1);
     }
 
-    fn fetch(&mut self) {
+    fn load_boot_rom(&mut self) {}
+
+    fn load_rom(&mut self, rom: &[u8]) {
+        self.memory.rom.copy_from_slice(&rom[..1024 * 16]);
+        self.memory.rom_banks[0].copy_from_slice(&rom[1024 * 16..]);
+    }
+
+    fn load_debug_initial_state(&mut self) {
+        self.registers.a = 0x01;
+        *self.registers.f = 0xB0;
+        self.registers.b = 0x00;
+        self.registers.c = 0x13;
+        self.registers.d = 0x00;
+        self.registers.e = 0xD8;
+        self.registers.h = 0x01;
+        self.registers.l = 0x4D;
+        self.registers.sp = 0xFFFE;
+        self.pc = 0x0100;
+    }
+
+    fn run(&mut self) {
+        debug!(
+            "A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
+            self.registers.a,
+            *self.registers.f,
+            self.registers.b,
+            self.registers.c,
+            self.registers.d,
+            self.registers.e,
+            self.registers.h,
+            self.registers.l,
+            self.registers.sp,
+            self.pc,
+            self.memory.read_u8(self.pc),
+            self.memory.read_u8(self.pc + 1),
+            self.memory.read_u8(self.pc + 2),
+            self.memory.read_u8(self.pc + 3),
+        );
+        self.ir = self.memory.read_u8(self.pc);
+        self.pc = self.pc.wrapping_add(1);
+        loop {
+            if self.halted {
+                if (self.memory.io.interrupt.interrupt_flag & self.memory.ie) != 0 {
+                    self.halted = false;
+                    self.tick_and_increment_pc();
+                } else {
+                    self.tick();
+                    continue;
+                }
+            }
+
+            if (self.memory.io.interrupt.interrupt_flag & self.memory.ie) != 0 && self.ime {
+                self.handle_interrupts();
+            } else if !self.halted {
+                let operation = self.decode();
+                self.execute_operation(operation);
+                debug!(
+                    "A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
+                    self.registers.a,
+                    *self.registers.f,
+                    self.registers.b,
+                    self.registers.c,
+                    self.registers.d,
+                    self.registers.e,
+                    self.registers.h,
+                    self.registers.l,
+                    self.registers.sp,
+                    self.pc,
+                    self.memory.read_u8(self.pc),
+                    self.memory.read_u8(self.pc + 1),
+                    self.memory.read_u8(self.pc + 2),
+                    self.memory.read_u8(self.pc + 3),
+                );
+            }
+
+            if !self.halted {
+                self.ir = self.memory.read_u8(self.pc);
+                self.tick_and_increment_pc();
+            } else {
+                self.ir = self.memory.read_u8(self.pc);
+                self.tick();
+            }
+        }
+    }
+
+    fn handle_interrupts(&mut self) {
+        let masked = self.memory.io.interrupt.interrupt_flag & self.memory.ie;
+        let next_interrupt = if masked & 0b1 != 0 {
+            InterruptType::VBlank
+        } else if masked & 0b10 != 0 {
+            InterruptType::LCD
+        } else if masked & 0b100 != 0 {
+            InterruptType::Timer
+        } else if masked & 0b1000 != 0 {
+            InterruptType::Serial
+        } else if masked & 0b10000 != 0 {
+            InterruptType::Joypad
+        } else {
+            panic!()
+        };
+        let address = match next_interrupt {
+            InterruptType::Joypad => 0x0060,
+            InterruptType::Serial => 0x0058,
+            InterruptType::Timer => 0x0050,
+            InterruptType::LCD => 0x0048,
+            InterruptType::VBlank => 0x0040,
+        };
+        self.memory.io.interrupt.clear_interrupt(next_interrupt);
+        self.ime = false;
+        self.pc = self.pc.wrapping_sub(1);
+        self.tick();
+        self.tick();
+        self.execute_operation(Operation::Call(Condition::None, Target::Imm16(address)));
+    }
+
+    fn decode(&mut self) -> Operation {
         use Registers8::*;
         use Registers16::*;
         use Target::*;
-        let operation = match decompose_octal_triplet(self.ir) {
+        match decompose_octal_triplet(self.ir) {
             // https://gbdev.io/gb-opcodes/optables/octal
             (0o0, 0o0, 0o0) => Operation::Nop,
             (0o0, 0o1, 0o0) => {
@@ -537,7 +923,7 @@ impl CPU {
             (0o0, 0o6, 0o7) => Operation::SetCarry,
             (0o0, 0o7, 0o7) => Operation::ComplementCarry,
             (0o1, 0o5, 0o6) => Operation::Halt,
-            (0o1, destination @ 0o0..=0o7, source @ _) => {
+            (0o1, destination @ 0o0..=0o7, source) => {
                 let destination = match destination {
                     0o0 => R8(B),
                     0o1 => R8(C),
@@ -665,8 +1051,8 @@ impl CPU {
                 };
                 let source = R8(A);
                 match op {
-                    0o4..=0o5 => Operation::Load(source, dest),
-                    0o6..=0o7 => Operation::Load(dest, source),
+                    0o4..=0o5 => Operation::Load(dest, source),
+                    0o6..=0o7 => Operation::Load(source, dest),
                     _ => unreachable!(),
                 }
             }
@@ -750,7 +1136,7 @@ impl CPU {
                 Operation::Restart(address)
             }
             (0o4.., _, _) | (_, 0o10.., _) | (_, _, 0o10..) => unreachable!(),
-        };
+        }
     }
 
     fn fetch_cb_operation(&mut self) -> Operation {
@@ -772,7 +1158,7 @@ impl CPU {
             _ => unreachable!(),
         };
 
-        let operation = match operation {
+        match operation {
             0o0 => Operation::Rotate(RotationType::Circular, Direction::Left, target),
             0o1 => Operation::Rotate(RotationType::Circular, Direction::Right, target),
             0o2 => Operation::Rotate(RotationType::NonCircular, Direction::Left, target),
@@ -785,8 +1171,7 @@ impl CPU {
             number @ 0o20..=0o27 => Operation::ResetBit(number - 0o20, target),
             number @ 0o30..=0o37 => Operation::SetBit(number - 0o30, target),
             0o40.. => unreachable!(),
-        };
-        operation
+        }
     }
 
     fn execute_operation(&mut self, operation: Operation) {
@@ -923,7 +1308,7 @@ impl CPU {
                     .f
                     .set_zero(result == 0)
                     .set_subtract(false)
-                    .set_half_carry(false)
+                    .set_half_carry(true)
                     .set_carry(false);
                 self.registers.a = result;
             }
@@ -1019,22 +1404,17 @@ impl CPU {
                         }
                         _ => unimplemented!("Invalid targets for operation"),
                     };
-                    let incoming_carry = self.registers.f.carry() as u8;
-                    let (result, carry1) = self.registers.a.overflowing_sub(value);
-                    let (result, carry2) = result.overflowing_sub(incoming_carry);
+
+                    let (result, carry) = self.registers.a.overflowing_add(value);
 
                     self.registers
                         .f
                         .set_zero(result == 0)
-                        .set_subtract(true)
+                        .set_subtract(false)
                         .set_half_carry(
-                            (self.registers.a & 0xF)
-                                .wrapping_sub(value & 0xF)
-                                .wrapping_sub(incoming_carry & 0xF)
-                                & 0x10
-                                == 0x10,
+                            (self.registers.a & 0xF).wrapping_add(value & 0xF) & 0x10 == 0x10,
                         )
-                        .set_carry(carry1 || carry2);
+                        .set_carry(carry);
                     self.registers.a = result;
                 }
                 Target::R16(Registers16::HL) => match source {
@@ -1164,17 +1544,19 @@ impl CPU {
                     Condition::NC => !self.registers.f.carry(),
                     Condition::C => self.registers.f.carry(),
                 };
-                let [lsb, msb] = self.pc.to_le_bytes();
-                self.registers.sp = self.registers.sp.wrapping_sub(1);
-                self.tick();
-                self.memory.set_u8(self.registers.sp, msb);
-                self.registers.sp = self.registers.sp.wrapping_sub(1);
-                self.tick();
-                self.memory.set_u8(self.registers.sp, lsb);
-                let Target::Imm16(address) = target else {
-                    unimplemented!("Invalid target for operation");
-                };
-                self.pc = address;
+                if condition_met {
+                    let [lsb, msb] = self.pc.to_le_bytes();
+                    self.registers.sp = self.registers.sp.wrapping_sub(1);
+                    self.tick();
+                    self.memory.set_u8(self.registers.sp, msb);
+                    self.registers.sp = self.registers.sp.wrapping_sub(1);
+                    self.tick();
+                    self.memory.set_u8(self.registers.sp, lsb);
+                    let Target::Imm16(address) = target else {
+                        unimplemented!("Invalid target for operation");
+                    };
+                    self.pc = address;
+                }
                 self.tick();
             }
             Operation::Restart(address) => {
@@ -1188,21 +1570,181 @@ impl CPU {
                 self.pc = address;
                 self.tick();
             }
-            Operation::Rotate(rotation_type, direction, target) => todo!(),
-            Operation::ShiftArithmetic(direction, target) => todo!(),
-            Operation::Swap(target) => todo!(),
-            Operation::ShiftRightLogical(target) => todo!(),
-            Operation::TestBit(_, target) => todo!(),
-            Operation::ResetBit(_, target) => todo!(),
-            Operation::SetBit(_, target) => todo!(),
+            Operation::Rotate(rotation_type, direction, target) => {
+                self.rotate(rotation_type, direction, target)
+            }
+            Operation::ShiftArithmetic(direction, target) => {
+                let prev_value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        let value = self.memory.read_u8(self.registers.hl());
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                };
+
+                let (result, carry) = match direction {
+                    Direction::Left => (prev_value << 1, (prev_value >> 7) & 0b1 == 0b1),
+                    Direction::Right => (
+                        (prev_value >> 1) | (prev_value & 0b1000_0000),
+                        prev_value & 0b1 == 0b1,
+                    ),
+                };
+
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(false)
+                    .set_half_carry(false)
+                    .set_carry(carry);
+                match target {
+                    Target::R8(register) => {
+                        self.set_register8(register, result);
+                    }
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        self.memory.set_u8(self.registers.hl(), result);
+                        self.tick();
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                }
+            }
+            Operation::Swap(target) => {
+                let prev_value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        let value = self.memory.read_u8(self.registers.hl());
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                };
+
+                let low = prev_value & 0b1111;
+                let high = (prev_value >> 4) & 0b1111;
+                let result = (low << 4) | high;
+
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(false)
+                    .set_half_carry(false)
+                    .set_carry(false);
+                match target {
+                    Target::R8(register) => {
+                        self.set_register8(register, result);
+                    }
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        self.memory.set_u8(self.registers.hl(), result);
+                        self.tick();
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                }
+            }
+            Operation::ShiftRightLogical(target) => {
+                let prev_value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        let value = self.memory.read_u8(self.registers.hl());
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                };
+
+                let result = prev_value >> 1;
+                let carry = prev_value & 0b1 == 0b1;
+
+                self.registers
+                    .f
+                    .set_zero(result == 0)
+                    .set_subtract(false)
+                    .set_half_carry(false)
+                    .set_carry(carry);
+                match target {
+                    Target::R8(register) => {
+                        self.set_register8(register, result);
+                    }
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        self.memory.set_u8(self.registers.hl(), result);
+                        self.tick();
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                }
+            }
+            Operation::TestBit(bit, target) => {
+                let prev_value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        let value = self.memory.read_u8(self.registers.hl());
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                };
+                self.registers
+                    .f
+                    .set_zero((prev_value >> bit) & 0b1 == 0)
+                    .set_subtract(false)
+                    .set_half_carry(true);
+            }
+            Operation::ResetBit(bit, target) => {
+                let prev_value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        let value = self.memory.read_u8(self.registers.hl());
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                };
+                let result = prev_value & !(0b1 << (bit - 1));
+
+                match target {
+                    Target::R8(register) => {
+                        self.set_register8(register, result);
+                    }
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        self.memory.set_u8(self.registers.hl(), result);
+                        self.tick();
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                }
+            }
+            Operation::SetBit(bit, target) => {
+                let prev_value = match target {
+                    Target::R8(register) => self.read_register8(register),
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        let value = self.memory.read_u8(self.registers.hl());
+                        self.tick();
+                        value
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                };
+                let result = prev_value | (0b1 << (bit - 1));
+
+                match target {
+                    Target::R8(register) => {
+                        self.set_register8(register, result);
+                    }
+                    Target::Ind(Indirect::R16(Registers16::HL)) => {
+                        self.memory.set_u8(self.registers.hl(), result);
+                        self.tick();
+                    }
+                    _ => unimplemented!("Invalid target for operation"),
+                }
+            }
         }
     }
 
-    fn halt(&self) {
-        todo!()
+    fn halt(&mut self) {
+        self.halted = false;
     }
 
     fn load(&mut self, destination: Target, source: Target) {
+        // if self.pc == 0xC227 {
+        //     debug!("BUGGED POINT: {:?} {:?}", destination, source)
+        // }
         match source {
             Target::R8(register) => self.load8(destination, self.read_register8(register)),
             Target::Imm8(value) => self.load8(destination, value),
@@ -1332,13 +1874,13 @@ impl CPU {
 
     fn set_register8(&mut self, register: Registers8, value: u8) {
         match register {
-            Registers8::A => self.registers.a == value,
-            Registers8::B => self.registers.b == value,
-            Registers8::C => self.registers.c == value,
-            Registers8::D => self.registers.d == value,
-            Registers8::E => self.registers.e == value,
-            Registers8::H => self.registers.h == value,
-            Registers8::L => self.registers.l == value,
+            Registers8::A => self.registers.a = value,
+            Registers8::B => self.registers.b = value,
+            Registers8::C => self.registers.c = value,
+            Registers8::D => self.registers.d = value,
+            Registers8::E => self.registers.e = value,
+            Registers8::H => self.registers.h = value,
+            Registers8::L => self.registers.l = value,
         };
     }
 
@@ -1494,7 +2036,7 @@ impl CPU {
                 )
             }
             (RotationType::NonCircular, Direction::Right) => {
-                let b0 = (self.registers.a >> 7) & 0b1 == 1;
+                let b0 = self.registers.a & 0b1 == 1;
                 (
                     self.registers.a.shr(1) | (self.registers.f.carry().conv::<u8>() << 7),
                     b0,
@@ -1508,6 +2050,58 @@ impl CPU {
             .set_subtract(false)
             .set_half_carry(false)
             .set_carry(carry);
+    }
+
+    fn rotate(&mut self, rotation_type: RotationType, direction: Direction, target: Target) {
+        let prev_value = match target {
+            Target::R8(register) => self.read_register8(register),
+            Target::Ind(Indirect::R16(Registers16::HL)) => {
+                let value = self.memory.read_u8(self.registers.hl());
+                self.tick();
+                value
+            }
+            _ => unimplemented!("Invalid target for operation"),
+        };
+        let (result, carry) = match (rotation_type, direction) {
+            (RotationType::Circular, Direction::Left) => {
+                let b7 = (prev_value >> 7) & 0b1 == 1;
+                (prev_value.rotate_left(1), b7)
+            }
+            (RotationType::Circular, Direction::Right) => {
+                let b0 = prev_value & 0b1 == 1;
+                (prev_value.rotate_right(1), b0)
+            }
+            (RotationType::NonCircular, Direction::Left) => {
+                let b7 = (prev_value >> 7) & 0b1 == 1;
+                (
+                    prev_value.shl(1) | self.registers.f.carry().conv::<u8>(),
+                    b7,
+                )
+            }
+            (RotationType::NonCircular, Direction::Right) => {
+                let b0 = prev_value & 0b1 == 1;
+                (
+                    prev_value.shr(1) | (self.registers.f.carry().conv::<u8>() << 7),
+                    b0,
+                )
+            }
+        };
+        self.registers
+            .f
+            .set_zero(result == 0)
+            .set_subtract(false)
+            .set_half_carry(false)
+            .set_carry(carry);
+        match target {
+            Target::R8(register) => {
+                self.set_register8(register, result);
+            }
+            Target::Ind(Indirect::R16(Registers16::HL)) => {
+                self.memory.set_u8(self.registers.hl(), result);
+                self.tick();
+            }
+            _ => unimplemented!("Invalid target for operation"),
+        }
     }
 }
 
