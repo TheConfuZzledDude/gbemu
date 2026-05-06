@@ -4,10 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+array-deque = "0.4.0"
 better_default = "1.0.5"
+bytemuck = { version = "1.25.0", features = ["derive"] }
 bytes = "1.11.1"
 iced = { version = "0.14", features = ["canvas", "advanced", "image", "wgpu"] }
 iced_renderer = { version = "0.14.0", features = ["image", "wgpu", "iced_wgpu"] }
+paste = "1.0.15"
+strum = { version = "0.28.0", features = ["derive"] }
 tap = "1.0.1"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
