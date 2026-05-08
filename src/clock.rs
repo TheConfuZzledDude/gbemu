@@ -1,6 +1,6 @@
 use core::time::Duration;
 use std::{
-    sync::mpsc::{self, Receiver, Sender},
+    sync::mpsc::Sender,
     thread,
 };
 

@@ -1,5 +1,5 @@
 #![allow(clippy::upper_case_acronyms)]
-
+#![feature(uint_gather_scatter_bits)]
 use better_default::Default;
 
 use bytes::BytesMut;
@@ -41,9 +41,9 @@ fn main() -> iced::Result {
     Ok(())
 }
 
-fn update(state: &mut State, message: Message) {}
+fn update(_state: &mut State, _message: Message) {}
 
-fn view(state: &State) -> Element<'_, Message> {
+fn view(_state: &State) -> Element<'_, Message> {
     column![
         text("Test"),
         canvas(Buffer::default()).width(160 * 3).height(144 * 3)
@@ -80,11 +80,11 @@ impl<Message> canvas::Program<Message> for Buffer {
 
     fn draw(
         &self,
-        state: &Self::State,
+        _state: &Self::State,
         renderer: &Renderer,
-        theme: &iced_renderer::core::Theme,
+        _theme: &iced_renderer::core::Theme,
         bounds: iced::Rectangle,
-        cursor: iced::advanced::mouse::Cursor,
+        _cursor: iced::advanced::mouse::Cursor,
     ) -> Vec<canvas::Geometry<Renderer>> {
         let screen = self.cache.draw(renderer, bounds.size(), |frame| {
             let image = Image::from(&Handle::from_rgba(160, 144, self.buffer.clone()))

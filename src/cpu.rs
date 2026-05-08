@@ -1,6 +1,6 @@
 use better_default::Default;
 use tap::Conv;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::context::{self, Context};
 
@@ -1437,7 +1437,7 @@ impl CPU {
         }
     }
 
-    pub(crate) fn stop(&self, ctx: &mut Context) {
+    pub(crate) fn stop(&self, _ctx: &mut Context) {
         todo!()
     }
 

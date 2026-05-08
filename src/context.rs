@@ -1,8 +1,6 @@
 use better_default::Default;
-use tap::Conv;
-use tracing::{debug, error, info};
 
-use crate::ppu::{LCDRegisters, Vram};
+use crate::ppu::{LCDRegisters, Oam, Vram};
 
 pub(crate) type Memory16K = [u8; 1024 * 16];
 
@@ -257,8 +255,7 @@ pub(crate) struct MemoryBus {
     pub(crate) wram1: Memory4K,
     #[default([0; 1024 * 4])]
     pub(crate) wram2: Memory4K,
-    #[default([0; 0xFEA0 - 0xFE00])]
-    pub(crate) oam: [u8; 0xFEA0 - 0xFE00],
+    pub(crate) oam: Oam,
     pub(crate) io: IoRegisters,
     #[default([0; 0xFFFF-0xFF80])]
     pub(crate) hram: [u8; 0xFFFF - 0xFF80],

@@ -1,10 +1,15 @@
+#![allow(unused)]
+
 use core::{
+    iter::Cloned,
     mem,
     ops::{BitAnd, BitOr, Deref, DerefMut, Index, IndexMut, Not, Shl, Shr},
+    slice,
 };
 use std::process::Output;
 
 use crate::context::{Context, Memory8K};
+use array_deque::{ArrayDeque, StackArrayDeque};
 use better_default::Default;
 use bytemuck::TransparentWrapper;
 use paste::paste;
@@ -62,13 +67,7 @@ impl Deref for Lcdc {
     }
 }
 impl Lcdc {
-    fn enable(&self) -> bool {
-        get_bit(self.0, 7)
-    }
-
-    fn set_enable(&mut self, value: bool) {
-        set_bit(&mut self.0, 7, value);
-    }
+    bit_getters!(enable, 7);
 
     fn window_tile_map(&self) -> TileMapArea {
         TileMapArea::from_repr(get_bit(self.0, 6) as u8).unwrap()
@@ -78,19 +77,13 @@ impl Lcdc {
         set_bit(&mut self.0, 6, map as u8 != 0);
     }
 
-    fn window_enable(&self) -> bool {
-        get_bit(self.0, 5)
+    bit_getters!(window_enable, 5);
+
+    fn tile_data_mapping(&self) -> TileDataMapping {
+        TileDataMapping::from_repr(get_bit(self.0, 4) as u8).unwrap()
     }
 
-    fn set_window_enable(&mut self, value: bool) {
-        set_bit(&mut self.0, 5, value);
-    }
-
-    fn tile_data_area(&self) -> TileDataArea {
-        TileDataArea::from_repr(get_bit(self.0, 4) as u8).unwrap()
-    }
-
-    fn set_tile_data_area(&mut self, map: TileDataArea) {
+    fn set_tile_data_mapping(&mut self, map: TileDataMapping) {
         set_bit(&mut self.0, 4, map as u8 != 0);
     }
 
@@ -110,20 +103,9 @@ impl Lcdc {
         set_bit(&mut self.0, 2, map as u8 != 0);
     }
 
-    fn obj_enable(&self) -> bool {
-        get_bit(self.0, 1)
-    }
+    bit_getters!(obj_enable, 1);
 
-    fn set_obj_enable(&mut self, value: bool) {
-        set_bit(&mut self.0, 1, value);
-    }
-    fn bg_window_enable(&self) -> bool {
-        get_bit(self.0, 0)
-    }
-
-    fn set_bg_window_enable(&mut self, value: bool) {
-        set_bit(&mut self.0, 0, value);
-    }
+    bit_getters!(bg_window_enable, 0);
 }
 
 #[derive(Debug, Default)]
@@ -174,7 +156,7 @@ enum ObjSize {
 
 #[derive(Copy, Clone, Debug, FromRepr)]
 #[repr(u8)]
-enum TileDataArea {
+enum TileDataMapping {
     Zero,
     One,
 }
@@ -202,10 +184,49 @@ impl Vram {
     fn window_tile_map_mut(&mut self, ctx: &mut Context) -> &mut [u8] {
         self.tile_map_mut(ctx.memory.io.lcd.lcdc.window_tile_map())
     }
+
+    fn bg_tile_data(&self, mapping: TileDataMapping, tile_no: u8) -> &[u8; 16] {
+        match mapping {
+            TileDataMapping::Zero => {
+                let tile_data = &self.0[0x8000 - VRAM_BASE_ADDRESS..=0x8FFF - VRAM_BASE_ADDRESS];
+                let (tiles, []) = tile_data.as_chunks::<16>() else {
+                    unreachable!()
+                };
+                &tiles[tile_no as usize]
+            }
+            TileDataMapping::One => {
+                let tile_data = &self.0[0x8800 - VRAM_BASE_ADDRESS..=0x97FF - VRAM_BASE_ADDRESS];
+                let (tiles, []) = tile_data.as_chunks::<16>() else {
+                    unreachable!()
+                };
+                &tiles[tile_no.wrapping_add(128) as usize]
+            }
+        }
+    }
+    fn bg_tile_data_mut(&mut self, mapping: TileDataMapping, tile_no: u8) -> &mut [u8; 16] {
+        match mapping {
+            TileDataMapping::Zero => {
+                let tile_data =
+                    &mut self.0[0x8000 - VRAM_BASE_ADDRESS..=0x8FFF - VRAM_BASE_ADDRESS];
+                let (tiles, []) = tile_data.as_chunks_mut::<16>() else {
+                    unreachable!()
+                };
+                &mut tiles[tile_no as usize]
+            }
+            TileDataMapping::One => {
+                let tile_data =
+                    &mut self.0[0x8800 - VRAM_BASE_ADDRESS..=0x97FF - VRAM_BASE_ADDRESS];
+                let (tiles, []) = tile_data.as_chunks_mut::<16>() else {
+                    unreachable!()
+                };
+                &mut tiles[tile_no.wrapping_add(128) as usize]
+            }
+        }
+    }
 }
 #[repr(transparent)]
-#[derive(Clone, Copy)]
-struct Oam([u8; 0xFEA0 - 0xFE00]);
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Oam(#[default([0;0xFEA0 - 0xFE00])] [u8; 0xFEA0 - 0xFE00]);
 
 impl DerefMut for Oam {
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -239,15 +260,15 @@ impl Oam {
 
 #[derive(Debug, Clone, Copy, Default, TransparentWrapper)]
 #[repr(transparent)]
-struct OamAttribute(u8);
+struct OamAttributes(u8);
 
-impl DerefMut for OamAttribute {
+impl DerefMut for OamAttributes {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl Deref for OamAttribute {
+impl Deref for OamAttributes {
     type Target = u8;
 
     fn deref(&self) -> &Self::Target {
@@ -255,7 +276,7 @@ impl Deref for OamAttribute {
     }
 }
 
-impl OamAttribute {
+impl OamAttributes {
     bit_getters!(priority, 7);
     bit_getters!(y_flip, 6);
     bit_getters!(x_flip, 5);
@@ -287,31 +308,31 @@ impl Deref for OamEntry {
     }
 }
 impl OamEntry {
-    fn y(&self) -> &u8 {
-        &self.0[0]
+    fn y(&self) -> u8 {
+        self.0[0]
     }
     fn y_mut(&mut self) -> &mut u8 {
         &mut self.0[0]
     }
-    fn x(&self) -> &u8 {
-        &self.0[1]
+    fn x(&self) -> u8 {
+        self.0[1]
     }
     fn x_mut(&mut self) -> &mut u8 {
         &mut self.0[1]
     }
 
-    fn tile_index(&self) -> &u8 {
-        &self.0[2]
+    fn tile_index(&self) -> u8 {
+        self.0[2]
     }
     fn tile_index_mut(&mut self) -> &mut u8 {
         &mut self.0[2]
     }
 
-    fn attributes(&self) -> &OamAttribute {
-        OamAttribute::wrap_ref(&self.0[3])
+    fn attributes(&self) -> &OamAttributes {
+        OamAttributes::wrap_ref(&self.0[3])
     }
-    fn attributes_mut(&mut self) -> &mut OamAttribute {
-        OamAttribute::wrap_mut(&mut self.0[3])
+    fn attributes_mut(&mut self) -> &mut OamAttributes {
+        OamAttributes::wrap_mut(&mut self.0[3])
     }
 }
 
@@ -332,10 +353,10 @@ struct FifoPixel {
 #[derive(Debug, Clone, Copy, FromRepr)]
 #[repr(u8)]
 enum Pixel {
-    Zero,
-    One,
-    Two,
-    Three,
+    White,
+    LightGray,
+    DarkGrey,
+    Black,
 }
 
 #[derive(Debug, Clone, Copy, FromRepr)]
@@ -355,5 +376,139 @@ enum PixelSource {
 
 // Reference for PPU details: https://www.youtube.com/watch?v=HyzD8pNlpwI&t=1760s
 struct PPU {
+    cycle_counter: u32,
     current_mode: Mode,
+    obj_buffer: StackArrayDeque<OamEntry, 10>,
+    oam_copy: ArrayDeque<OamEntry>,
+    pixel_fifo: StackArrayDeque<FifoPixel, 16>,
+    fifo_state: FifoState,
+    screen_x: u8,
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct FifoState {
+    tile_no: Option<u8>,
+    data_low: Option<u8>,
+    data_high: Option<u8>,
+    buffer: [u8; 8],
+    tile_line: u8,
+}
+
+impl PPU {
+    fn tick(&mut self, ctx: &mut Context) {
+        match self.current_mode {
+            Mode::OamScan => self.oam_scan(ctx),
+            Mode::PixelTransfer => self.pixel_transfer(ctx),
+            Mode::HBlank => todo!(),
+            Mode::VBlank => todo!(),
+        };
+        self.cycle_counter += 1;
+    }
+
+    fn oam_scan(&mut self, ctx: &mut Context) {
+        match self.cycle_counter {
+            0 => {
+                self.obj_buffer.clear();
+                self.oam_copy = ArrayDeque::from(ctx.memory.oam.oam_entries());
+            }
+            x if x % 2 == 0 => {
+                //Stall
+            }
+            x => {
+                if !self.obj_buffer.is_full()
+                    && let Some(next_obj) = self.oam_copy.pop_front()
+                    && next_obj.x() != 0
+                    && object_on_scanline(
+                        next_obj.y(),
+                        ctx.memory.io.lcd.ly,
+                        ctx.memory.io.lcd.lcdc.obj_size(),
+                    )
+                {
+                    self.obj_buffer.push_back(next_obj);
+                }
+            }
+        }
+        if self.cycle_counter == 79 {
+            self.current_mode = Mode::PixelTransfer
+        }
+    }
+
+    fn pixel_transfer(&mut self, ctx: &mut Context) {
+        if self.pixel_fifo.len() > 8 {
+            let pixel = self.pixel_fifo.pop_front();
+            // pusht he pixel
+        }
+        if self.cycle_counter % 2 == 1 {
+            if self.fifo_state.tile_no.is_none() {
+                self.fetch_tile(ctx);
+            } else if self.fifo_state.data_low.is_none() {
+                let Some(tile_no) = self.fifo_state.tile_no else {
+                    unreachable!()
+                };
+                self.fifo_state.data_low = Some(
+                    ctx.memory
+                        .vram
+                        .bg_tile_data(ctx.memory.io.lcd.lcdc.tile_data_mapping(), tile_no)
+                        [self.fifo_state.tile_line as usize * 2],
+                )
+            } else if self.fifo_state.data_high.is_none() {
+                let Some(tile_no) = self.fifo_state.tile_no else {
+                    unreachable!()
+                };
+                self.fifo_state.data_high = Some(
+                    ctx.memory
+                        .vram
+                        .bg_tile_data(ctx.memory.io.lcd.lcdc.tile_data_mapping(), tile_no)
+                        [self.fifo_state.tile_line as usize * 2 + 1],
+                )
+            }
+            if let (Some(low), Some(high)) = (self.fifo_state.data_low, self.fifo_state.data_high)
+                && self.pixel_fifo.len() <= 8
+            {
+                let tile_row = u16::from_le_bytes([low, high]);
+                for n in 0..8 {
+                    let palette_index = tile_row.extract_bits(0b1000_0000_1000_0000 >> n);
+                    let palette = ctx.memory.io.lcd.bgp;
+                    let colour = Pixel::from_repr((palette >> (palette_index * 2)) & 0b11).unwrap();
+                    self.pixel_fifo.push_back(FifoPixel {
+                        pixel: colour,
+                        source: PixelSource::BG,
+                    });
+                }
+            }
+        }
+    }
+
+    fn fetch_tile(&mut self, ctx: &mut Context) {
+        let in_window = self.screen_x >= ctx.memory.io.lcd.wx
+            && ctx.memory.io.lcd.ly >= ctx.memory.io.lcd.wy
+            && ctx.memory.io.lcd.lcdc.window_enable();
+        let tile_map_area = if !in_window {
+            ctx.memory.io.lcd.lcdc.bg_tile_map()
+        } else {
+            ctx.memory.io.lcd.lcdc.window_tile_map()
+        };
+        let tile_x = if !in_window {
+            self.screen_x.wrapping_add(ctx.memory.io.lcd.scx)
+        } else {
+            self.screen_x - ctx.memory.io.lcd.wx
+        };
+        let tile_y = if !in_window {
+            ctx.memory.io.lcd.ly.wrapping_add(ctx.memory.io.lcd.scy)
+        } else {
+            ctx.memory.io.lcd.ly - ctx.memory.io.lcd.wy
+        };
+        self.fifo_state.tile_line = tile_y % 8;
+        let tile_map_index = ((tile_y as u16) / 8) << 5 | (tile_x as u16 / 8);
+        self.fifo_state.tile_no =
+            Some(ctx.memory.vram.tile_map(tile_map_area)[tile_map_index as usize]);
+    }
+}
+
+fn object_on_scanline(obj_y: u8, scanline_y: u8, size: ObjSize) -> bool {
+    match size {
+        ObjSize::Square => (obj_y..(obj_y + 8)),
+        ObjSize::Tall => (obj_y..(obj_y + 16)),
+    }
+    .contains(&scanline_y)
 }
