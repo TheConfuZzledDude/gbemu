@@ -24,3 +24,4 @@ rustc-ice-*.txt
 #.idea/
 
 bootrom/*
+log.txt
