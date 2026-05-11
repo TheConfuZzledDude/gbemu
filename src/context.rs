@@ -229,9 +229,7 @@ impl IoRegisters {
             0x30..=0x3F => {
                 //TODO: WAVE PATTERN
             }
-            0x40..=0x4B => {
-                //TODO: LCD/OAM
-            }
+            0x40..=0x4B => self.lcd.write(address, value),
 
             0x50 => {
                 // Bootrom bank control, write-only

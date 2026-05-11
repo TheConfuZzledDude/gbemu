@@ -14,10 +14,7 @@ use better_default::Default;
 use bytemuck::TransparentWrapper;
 use paste::paste;
 use strum::FromRepr;
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Lcdc(u8);
+use tap::Pipe;
 
 fn set_bit<T>(num: &mut T, index: u8, value: bool)
 where
@@ -52,6 +49,10 @@ macro_rules! bit_getters {
         }
     };
 }
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Lcdc(u8);
 
 impl DerefMut for Lcdc {
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -108,18 +109,94 @@ impl Lcdc {
     bit_getters!(bg_window_enable, 0);
 }
 
+#[derive(Debug, Copy, Clone, Default)]
+#[repr(transparent)]
+struct Stat(u8);
+
+impl DerefMut for Stat {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Deref for Stat {
+    type Target = u8;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Stat {
+    bit_getters!(lyc_select, 6);
+    bit_getters!(mode_2, 5);
+    bit_getters!(mode_1, 4);
+    bit_getters!(mode_0, 3);
+    bit_getters!(lyc_equal, 2);
+    fn ppu_mode(&self) -> Mode {
+        Mode::from_repr(self.0 as usize & 0b11).unwrap()
+    }
+
+    fn set_ppu_mode(&mut self, mode: Mode) {
+        self.0 = (self.0 & !0b11) | (mode as u8 & 0b11);
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct LCDRegisters {
     lcdc: Lcdc,
-    stat: u8,
+    stat: Stat,
     scy: u8,
     scx: u8,
     ly: u8,
     lyc: u8,
+    dma: u8,
     bgp: u8,
     obp: [u8; 2],
     wy: u8,
     wx: u8,
+    start_dma: bool,
+}
+
+impl LCDRegisters {
+    pub(crate) fn read(&self, address: u8) -> u8 {
+        match address {
+            0x40 => *self.lcdc,
+            0x41 => *self.stat,
+            0x42 => self.scy,
+            0x43 => self.scx,
+            0x44 => self.ly,
+            0x45 => self.lyc,
+            0x46 => self.dma,
+            0x47 => self.bgp,
+            0x48 => self.obp[0],
+            0x49 => self.obp[1],
+            0x4A => self.wy,
+            0x4B => self.wx,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn write(&mut self, address: u8, value: u8) {
+        match address {
+            0x40 => *self.lcdc = value,
+            0x41 => *self.stat = (*self.stat & 0b111) | (value & !0b111),
+            0x42 => self.scy = value,
+            0x43 => self.scx = value,
+            0x44 => {}
+            0x45 => self.lyc = value,
+            0x46 => {
+                self.dma = value;
+                self.start_dma = true;
+            }
+            0x47 => self.bgp = value,
+            0x48 => self.obp[0] = value,
+            0x49 => self.obp[1] = value,
+            0x4A => self.wy = value,
+            0x4B => self.wx = value,
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[repr(transparent)]
@@ -183,6 +260,22 @@ impl Vram {
     }
     fn window_tile_map_mut(&mut self, ctx: &mut Context) -> &mut [u8] {
         self.tile_map_mut(ctx.memory.io.lcd.lcdc.window_tile_map())
+    }
+
+    fn sprite_tile_data(&self, sprite_size: ObjSize, tile_no: u8) -> &[u8] {
+        let tile_data = &self.0[0x8000 - VRAM_BASE_ADDRESS..=0x8FFF - VRAM_BASE_ADDRESS];
+        let (tiles, []) = tile_data.as_chunks::<16>() else {
+            unreachable!()
+        };
+        match sprite_size {
+            ObjSize::Square => &tiles[tile_no as usize],
+            ObjSize::Tall => {
+                let (tiles, []) = tile_data.as_chunks::<32>() else {
+                    unreachable!()
+                };
+                &tiles[(tile_no / 2) as usize]
+            }
+        }
     }
 
     fn bg_tile_data(&self, mapping: TileDataMapping, tile_no: u8) -> &[u8; 16] {
@@ -336,7 +429,7 @@ impl OamEntry {
     }
 }
 
-#[derive(Copy, Clone, Debug, FromRepr)]
+#[derive(Copy, Clone, Debug, FromRepr, PartialEq, Eq)]
 enum Mode {
     OamScan = 2,
     PixelTransfer = 3,
@@ -345,15 +438,17 @@ enum Mode {
     VBlank = 1,
 }
 
-struct FifoPixel {
-    pixel: Pixel,
+struct SpritePixel {
+    palette_index: u8,
     source: PixelSource,
+    palette: bool,
+    priority: bool,
 }
 
 #[derive(Debug, Clone, Copy, FromRepr)]
 #[repr(u8)]
 enum Pixel {
-    White,
+    White = 0,
     LightGray,
     DarkGrey,
     Black,
@@ -361,7 +456,6 @@ enum Pixel {
 
 #[derive(Debug, Clone, Copy, FromRepr)]
 enum PixelSource {
-    BG = 10,
     S0 = 0,
     S1,
     S2,
@@ -380,18 +474,48 @@ struct PPU {
     current_mode: Mode,
     obj_buffer: StackArrayDeque<OamEntry, 10>,
     oam_copy: ArrayDeque<OamEntry>,
-    pixel_fifo: StackArrayDeque<FifoPixel, 16>,
-    fifo_state: FifoState,
+    bg_fifo: StackArrayDeque<u8, 16>,
+    sprite_fifo: StackArrayDeque<SpritePixel, 8>,
+    bg_fetcher_state: BgFetcherState,
+    sprite_fetcher_state: SpriteFetcherState,
     screen_x: u8,
+    scx_counter: u8,
+    sprites_to_fetch: ArrayDeque<(usize, OamEntry)>,
+    fetching_sprite: Option<OamEntry>,
+    oam_index: usize,
+    screen: [Pixel; 160 * 144],
+    stat_interrupt_line: bool,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
-struct FifoState {
+struct BgFetcherState {
     tile_no: Option<u8>,
     data_low: Option<u8>,
     data_high: Option<u8>,
-    buffer: [u8; 8],
     tile_line: u8,
+}
+impl BgFetcherState {
+    fn clear(&mut self) {
+        *self = Self::default()
+    }
+}
+
+#[derive(Default, Clone, Copy, Debug)]
+struct SpriteFetcherState {
+    tile_no: Option<u8>,
+    data_low: Option<u8>,
+    data_high: Option<u8>,
+    tile_line: u8,
+    oam_index: usize,
+    priority: bool,
+    y_flip: bool,
+    x_flip: bool,
+    palette: bool,
+}
+impl SpriteFetcherState {
+    fn clear(&mut self) {
+        *self = Self::default()
+    }
 }
 
 impl PPU {
@@ -399,10 +523,52 @@ impl PPU {
         match self.current_mode {
             Mode::OamScan => self.oam_scan(ctx),
             Mode::PixelTransfer => self.pixel_transfer(ctx),
-            Mode::HBlank => todo!(),
-            Mode::VBlank => todo!(),
+            Mode::HBlank => {
+                if self.cycle_counter == 455 {
+                    if ctx.memory.io.lcd.ly == 143 {
+                        self.current_mode = Mode::VBlank;
+                    } else {
+                        self.current_mode = Mode::OamScan;
+                    }
+                    ctx.memory.io.lcd.ly += 1;
+                    self.cycle_counter = 0;
+                }
+            }
+            Mode::VBlank => {
+                if self.cycle_counter == 0 && ctx.memory.io.lcd.ly == 144 {
+                    ctx.memory
+                        .io
+                        .interrupt
+                        .schedule_interrupt(crate::context::InterruptType::VBlank);
+                }
+                if self.cycle_counter == 455 {
+                    if ctx.memory.io.lcd.ly == 153 {
+                        self.current_mode = Mode::OamScan;
+                        self.cycle_counter = 0;
+                        ctx.memory.io.lcd.ly = 0;
+                    } else {
+                        ctx.memory.io.lcd.ly += 1;
+                    }
+                }
+            }
         };
         self.cycle_counter += 1;
+        ctx.memory
+            .io
+            .lcd
+            .stat
+            .set_lyc_equal(ctx.memory.io.lcd.ly == ctx.memory.io.lcd.lyc);
+        let stat_line = (ctx.memory.io.lcd.stat.lyc_select() && ctx.memory.io.lcd.stat.lyc_equal())
+            || (ctx.memory.io.lcd.stat.mode_2() && self.current_mode == Mode::OamScan)
+            || (ctx.memory.io.lcd.stat.mode_1() && self.current_mode == Mode::VBlank)
+            || (ctx.memory.io.lcd.stat.mode_0() && self.current_mode == Mode::HBlank);
+        if !self.stat_interrupt_line && stat_line {
+            ctx.memory
+                .io
+                .interrupt
+                .schedule_interrupt(crate::context::InterruptType::LCD);
+        }
+        self.stat_interrupt_line = stat_line;
     }
 
     fn oam_scan(&mut self, ctx: &mut Context) {
@@ -434,52 +600,131 @@ impl PPU {
     }
 
     fn pixel_transfer(&mut self, ctx: &mut Context) {
-        if self.pixel_fifo.len() > 8 {
-            let pixel = self.pixel_fifo.pop_front();
-            // pusht he pixel
+        if self.cycle_counter == 80 {
+            self.screen_x = 0;
+            self.scx_counter = ctx.memory.io.lcd.scx % 8;
         }
+        if self.sprites_to_fetch.is_empty() {
+            self.sprites_to_fetch = self
+                .obj_buffer
+                .iter()
+                .cloned()
+                .enumerate()
+                .filter(|(index, entry)| entry.x() + 8 == self.screen_x)
+                .collect();
+        };
         if self.cycle_counter % 2 == 1 {
-            if self.fifo_state.tile_no.is_none() {
-                self.fetch_tile(ctx);
-            } else if self.fifo_state.data_low.is_none() {
-                let Some(tile_no) = self.fifo_state.tile_no else {
-                    unreachable!()
-                };
-                self.fifo_state.data_low = Some(
-                    ctx.memory
-                        .vram
-                        .bg_tile_data(ctx.memory.io.lcd.lcdc.tile_data_mapping(), tile_no)
-                        [self.fifo_state.tile_line as usize * 2],
-                )
-            } else if self.fifo_state.data_high.is_none() {
-                let Some(tile_no) = self.fifo_state.tile_no else {
-                    unreachable!()
-                };
-                self.fifo_state.data_high = Some(
-                    ctx.memory
-                        .vram
-                        .bg_tile_data(ctx.memory.io.lcd.lcdc.tile_data_mapping(), tile_no)
-                        [self.fifo_state.tile_line as usize * 2 + 1],
-                )
+            if !self.sprites_to_fetch.is_empty() {
+                self.sprite_fetch(ctx);
+            } else {
+                self.bg_fetch(ctx);
             }
-            if let (Some(low), Some(high)) = (self.fifo_state.data_low, self.fifo_state.data_high)
-                && self.pixel_fifo.len() <= 8
-            {
-                let tile_row = u16::from_le_bytes([low, high]);
-                for n in 0..8 {
-                    let palette_index = tile_row.extract_bits(0b1000_0000_1000_0000 >> n);
-                    let palette = ctx.memory.io.lcd.bgp;
-                    let colour = Pixel::from_repr((palette >> (palette_index * 2)) & 0b11).unwrap();
-                    self.pixel_fifo.push_back(FifoPixel {
-                        pixel: colour,
-                        source: PixelSource::BG,
-                    });
+        }
+        if self.bg_fifo.len() > 8 && self.sprites_to_fetch.is_empty() {
+            if self.scx_counter > 0 {
+                self.bg_fifo.pop_front();
+                self.scx_counter -= 1;
+            } else {
+                let bg_palette_index = self.bg_fifo.pop_front().unwrap();
+
+                let colour = if let Some(sprite_pixel) = self.sprite_fifo.pop_front() {
+                    let sprite_palette = ctx.memory.io.lcd.obp[sprite_pixel.palette as usize];
+                    if sprite_pixel.palette_index == 0
+                        || (sprite_pixel.priority && bg_palette_index != 0)
+                    {
+                        Pixel::from_repr((ctx.memory.io.lcd.bgp >> (bg_palette_index * 2)) & 0b11)
+                            .unwrap()
+                    } else {
+                        Pixel::from_repr(
+                            (sprite_palette >> (sprite_pixel.palette_index * 2)) & 0b11,
+                        )
+                        .unwrap()
+                    }
+                } else {
+                    Pixel::from_repr((ctx.memory.io.lcd.bgp >> (bg_palette_index * 2)) & 0b11)
+                        .unwrap()
+                };
+                self.screen[ctx.memory.io.lcd.ly as usize * 144 + self.screen_x as usize] = colour;
+                self.screen_x += 1;
+                if self.screen_x == 160 {
+                    self.current_mode = Mode::HBlank;
+                    self.bg_fetcher_state.clear();
+                    self.sprite_fetcher_state.clear();
                 }
             }
         }
     }
 
-    fn fetch_tile(&mut self, ctx: &mut Context) {
+    fn bg_fetch(&mut self, ctx: &mut Context) {
+        let BgFetcherState {
+            tile_no,
+            data_low,
+            data_high,
+            tile_line,
+        } = &mut self.bg_fetcher_state;
+        match (tile_no, data_low, data_high) {
+            (None, _, _) => {
+                self.fetch_bg_tile(ctx);
+            }
+            (Some(tile_no), data_low @ None, _) => {
+                *data_low = Some(
+                    ctx.memory
+                        .vram
+                        .bg_tile_data(ctx.memory.io.lcd.lcdc.tile_data_mapping(), *tile_no)
+                        [*tile_line as usize * 2],
+                );
+            }
+            (Some(tile_no), Some(_), data_high @ None) => {
+                *data_high = Some(
+                    ctx.memory
+                        .vram
+                        .bg_tile_data(ctx.memory.io.lcd.lcdc.tile_data_mapping(), *tile_no)
+                        [*tile_line as usize * 2 + 1],
+                );
+            }
+            (Some(_), Some(low), Some(high)) => {}
+        }
+        if let (Some(low), Some(high)) = (
+            self.bg_fetcher_state.data_low,
+            self.bg_fetcher_state.data_high,
+        ) && self.bg_fifo.len() <= 8
+        {
+            let tile_row = u16::from_le_bytes([low, high]);
+            for n in 0..8 {
+                let palette_index = tile_row.extract_bits(0b1000_0000_1000_0000 >> n) as u8;
+                self.bg_fifo.push_back(palette_index);
+            }
+            self.bg_fetcher_state.clear();
+        }
+    }
+
+    // fn get_colour_from_pixel(pixel: FifoPixel, ctx: &mut Context) -> Pixel {
+    //     let FifoPixel {
+    //         palette_index,
+    //         source,
+    //     } = pixel;
+    //     let palette =
+    //     let colour = match source {
+    //         PixelSource::BG => ctx.memory.io.lcd.bgp;,
+    //         PixelSource::S0 => todo!(),
+    //         PixelSource::S1 => todo!(),
+    //         PixelSource::S2 => todo!(),
+    //         PixelSource::S3 => todo!(),
+    //         PixelSource::S4 => todo!(),
+    //         PixelSource::S5 => todo!(),
+    //         PixelSource::S6 => todo!(),
+    //         PixelSource::S7 => todo!(),
+    //         PixelSource::S8 => todo!(),
+    //         PixelSource::S9 => todo!(),
+    //     };
+    //     let colour = Pixel::from_repr((palette >> (palette_index * 2)) & 0b11).unwrap();
+    //     self.pixel_fifo.push_back(FifoPixel {
+    //         pixel: colour,
+    //         source: PixelSource::BG,
+    //     });
+    // }
+
+    fn fetch_bg_tile(&mut self, ctx: &mut Context) {
         let in_window = self.screen_x >= ctx.memory.io.lcd.wx
             && ctx.memory.io.lcd.ly >= ctx.memory.io.lcd.wy
             && ctx.memory.io.lcd.lcdc.window_enable();
@@ -498,10 +743,121 @@ impl PPU {
         } else {
             ctx.memory.io.lcd.ly - ctx.memory.io.lcd.wy
         };
-        self.fifo_state.tile_line = tile_y % 8;
+        self.bg_fetcher_state.tile_line = tile_y % 8;
         let tile_map_index = ((tile_y as u16) / 8) << 5 | (tile_x as u16 / 8);
-        self.fifo_state.tile_no =
+        self.bg_fetcher_state.tile_no =
             Some(ctx.memory.vram.tile_map(tile_map_area)[tile_map_index as usize]);
+    }
+
+    fn sprite_fetch(&mut self, ctx: &mut Context) {
+        {
+            let SpriteFetcherState {
+                tile_no,
+                data_low,
+                data_high,
+                tile_line,
+                x_flip,
+                y_flip,
+                priority,
+                palette,
+                oam_index,
+            } = &mut self.sprite_fetcher_state;
+
+            match (tile_no, data_low, data_high) {
+                (None, _, _) => {
+                    self.fetch_sprite_tile(ctx);
+                }
+                (Some(tile_no), data_low @ None, _) => {
+                    *data_low = Some(
+                        ctx.memory
+                            .vram
+                            .sprite_tile_data(ctx.memory.io.lcd.lcdc.obj_size(), *tile_no)
+                            .pipe(|data| {
+                                if *y_flip {
+                                    data[data.len() - 1 - *tile_line as usize * 2]
+                                } else {
+                                    data[*tile_line as usize * 2]
+                                }
+                            })
+                            .pipe(|data| if *x_flip { data.reverse_bits() } else { data }),
+                    );
+                }
+                (Some(tile_no), Some(_), data_high @ None) => {
+                    *data_high = Some(
+                        ctx.memory
+                            .vram
+                            .sprite_tile_data(ctx.memory.io.lcd.lcdc.obj_size(), *tile_no)
+                            .pipe(|data| {
+                                if *y_flip {
+                                    data[data.len() - 1 - (*tile_line as usize * 2 + 1)]
+                                } else {
+                                    data[*tile_line as usize * 2 + 1]
+                                }
+                            })
+                            .pipe(|data| if *x_flip { data.reverse_bits() } else { data }),
+                    );
+                }
+                (Some(_), Some(low), Some(high)) => {}
+            };
+        }
+        if let (Some(low), Some(high)) = (
+            self.sprite_fetcher_state.data_low,
+            self.sprite_fetcher_state.data_high,
+        ) {
+            let tile_row = u16::from_le_bytes([low, high]);
+            self.sprite_fifo = (0..8)
+                .map(|n| {
+                    let palette_index = tile_row.extract_bits(0b1000_0000_1000_0000 >> n) as u8;
+                    if let Some(SpritePixel {
+                        palette_index: current_palette_index,
+                        source,
+                        palette,
+                        priority,
+                    }) = self.sprite_fifo.pop_front()
+                    {
+                        if current_palette_index == 0 {
+                            SpritePixel {
+                                palette_index,
+                                source: PixelSource::from_repr(self.sprite_fetcher_state.oam_index)
+                                    .unwrap(),
+                                priority: self.sprite_fetcher_state.priority,
+                                palette: self.sprite_fetcher_state.palette,
+                            }
+                        } else {
+                            SpritePixel {
+                                palette_index: current_palette_index,
+                                source,
+                                palette,
+                                priority,
+                            }
+                        }
+                    } else {
+                        SpritePixel {
+                            palette_index,
+                            source: PixelSource::from_repr(self.sprite_fetcher_state.oam_index)
+                                .unwrap(),
+                            priority: self.sprite_fetcher_state.priority,
+                            palette: self.sprite_fetcher_state.palette,
+                        }
+                    }
+                })
+                .collect();
+
+            self.sprite_fetcher_state.clear();
+            self.sprites_to_fetch.pop_front();
+        }
+    }
+
+    fn fetch_sprite_tile(&mut self, ctx: &mut Context) {
+        if let Some((oam_index, current_sprite)) = self.sprites_to_fetch.front() {
+            self.sprite_fetcher_state.tile_line = ctx.memory.io.lcd.ly - (current_sprite.y() + 16);
+            self.sprite_fetcher_state.tile_no = Some(current_sprite.tile_index());
+            self.sprite_fetcher_state.oam_index = *oam_index;
+            self.sprite_fetcher_state.priority = current_sprite.attributes().priority();
+            self.sprite_fetcher_state.y_flip = current_sprite.attributes().y_flip();
+            self.sprite_fetcher_state.x_flip = current_sprite.attributes().x_flip();
+            self.sprite_fetcher_state.palette = current_sprite.attributes().dmg_palette();
+        }
     }
 }
 
@@ -510,5 +866,5 @@ fn object_on_scanline(obj_y: u8, scanline_y: u8, size: ObjSize) -> bool {
         ObjSize::Square => (obj_y..(obj_y + 8)),
         ObjSize::Tall => (obj_y..(obj_y + 16)),
     }
-    .contains(&scanline_y)
+    .contains(&(scanline_y + 16))
 }

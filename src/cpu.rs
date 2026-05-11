@@ -6,6 +6,7 @@ use crate::context::{self, Context};
 
 pub(crate) mod registers;
 
+#[derive(Debug, Copy, Clone)]
 pub(crate) enum Operation {
     Nop,
     Halt,
@@ -77,7 +78,7 @@ pub(crate) enum Indirect {
     C,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 
 pub(crate) enum Target {
     R8(Registers8),
@@ -111,6 +112,13 @@ pub(crate) enum Direction {
     Right,
 }
 
+#[derive(Debug, Default)]
+enum State {
+    #[default]
+    Decode(usize),
+    Execute(Operation, usize),
+}
+
 #[derive(Default)]
 pub(crate) struct CPU {
     pub(crate) registers: registers::Registers,
@@ -118,6 +126,16 @@ pub(crate) struct CPU {
     pub(crate) ir: u8,
     pub(crate) ime: bool,
     pub(crate) halted: bool,
+    pub(crate) state: State,
+    pub(crate) decode_state: DecodeState,
+}
+
+#[derive(Default)]
+pub(crate) struct DecodeState {
+    lsb: u8,
+    msb: u8,
+    value: u8,
+    offset: i8,
 }
 
 impl CPU {
@@ -194,25 +212,28 @@ impl CPU {
             if (ctx.memory.io.interrupt.interrupt_flag & ctx.memory.ie) != 0 && self.ime {
                 self.handle_interrupts(ctx);
             } else if !self.halted {
-                let operation = self.decode(ctx);
-                self.execute_operation(operation, ctx);
-                debug!(
-                    "A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
-                    self.registers.a,
-                    *self.registers.f,
-                    self.registers.b,
-                    self.registers.c,
-                    self.registers.d,
-                    self.registers.e,
-                    self.registers.h,
-                    self.registers.l,
-                    self.registers.sp,
-                    self.pc,
-                    ctx.memory.read_u8(self.pc),
-                    ctx.memory.read_u8(self.pc + 1),
-                    ctx.memory.read_u8(self.pc + 2),
-                    ctx.memory.read_u8(self.pc + 3),
-                );
+                if let State::Decode(_) = self.state {
+                    self.decode(ctx);
+                } else if let State::Execute(operation, _) = self.state {
+                    self.execute_operation(operation, ctx);
+                    debug!(
+                        "A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
+                        self.registers.a,
+                        *self.registers.f,
+                        self.registers.b,
+                        self.registers.c,
+                        self.registers.d,
+                        self.registers.e,
+                        self.registers.h,
+                        self.registers.l,
+                        self.registers.sp,
+                        self.pc,
+                        ctx.memory.read_u8(self.pc),
+                        ctx.memory.read_u8(self.pc + 1),
+                        ctx.memory.read_u8(self.pc + 2),
+                        ctx.memory.read_u8(self.pc + 3),
+                    );
+                }
             }
 
             if !self.halted {
@@ -258,24 +279,40 @@ impl CPU {
         );
     }
 
-    pub(crate) fn decode(&mut self, ctx: &mut Context) -> Operation {
+    #[inline(never)]
+    pub(crate) fn decode(&mut self, ctx: &mut Context) {
         use Registers8::*;
         use Registers16::*;
         use Target::*;
+        let State::Decode(step) = self.state else {
+            unreachable!()
+        };
         match decompose_octal_triplet(self.ir) {
             // https://gbdev.io/gb-opcodes/optables/octal
-            (0o0, 0o0, 0o0) => Operation::Nop,
-            (0o0, 0o1, 0o0) => {
-                let lsb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let msb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                Operation::Load(
-                    Ind(Indirect::Imm16(u16::from_le_bytes([lsb, msb]))),
-                    R16(SP),
-                )
-            }
-            (0o0, 0o2, 0o0) => Operation::Stop,
+            (0o0, 0o0, 0o0) => self.state = State::Execute(Operation::Nop, 0),
+            (0o0, 0o1, 0o0) => match step {
+                0 => {
+                    self.decode_state.lsb = ctx.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc(ctx);
+                }
+                1 => {
+                    self.decode_state.msb = ctx.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc(ctx);
+                    self.state = State::Execute(
+                        Operation::Load(
+                            Ind(Indirect::Imm16(u16::from_le_bytes([
+                                self.decode_state.lsb,
+                                self.decode_state.msb,
+                            ]))),
+                            R16(SP),
+                        ),
+                        0,
+                    );
+                }
+                _ => unreachable!(),
+            },
+
+            (0o0, 0o2, 0o0) => self.state = State::Execute(Operation::Stop, 0),
             (0o0, condition, 0o0) => {
                 use Condition::*;
                 let condition = match condition {
@@ -286,10 +323,19 @@ impl CPU {
                     0o7 => C,
                     _ => unreachable!(),
                 };
-
-                let offset = ctx.memory.read_u8(self.pc) as i8;
-                self.tick_and_increment_pc(ctx);
-                Operation::JumpRelative(condition, offset)
+                match step {
+                    0 => {
+                        self.decode_state.offset = ctx.memory.read_u8(self.pc) as i8;
+                        self.tick_and_increment_pc(ctx);
+                    }
+                    1 => {
+                        self.state = State::Execute(
+                            Operation::JumpRelative(condition, self.decode_state.offset),
+                            0,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
             }
             (0o0, op, 0o1) => {
                 let target = match op >> 1 {
@@ -300,13 +346,31 @@ impl CPU {
                     _ => unreachable!(),
                 };
                 if op & 0b1 == 0 {
-                    let lsb = ctx.memory.read_u8(self.pc);
-                    self.tick_and_increment_pc(ctx);
-                    let msb = ctx.memory.read_u8(self.pc);
-                    self.tick_and_increment_pc(ctx);
-                    Operation::Load(R16(target), Imm16(u16::from_le_bytes([lsb, msb])))
+                    match step {
+                        0 => {
+                            self.decode_state.lsb = ctx.memory.read_u8(self.pc);
+                            self.tick_and_increment_pc(ctx);
+                        }
+                        1 => {
+                            self.decode_state.msb = ctx.memory.read_u8(self.pc);
+                            self.tick_and_increment_pc(ctx);
+                        }
+                        2 => {
+                            self.state = State::Execute(
+                                Operation::Load(
+                                    R16(target),
+                                    Imm16(u16::from_le_bytes([
+                                        self.decode_state.lsb,
+                                        self.decode_state.msb,
+                                    ])),
+                                ),
+                                0,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
                 } else {
-                    Operation::Add(R16(HL), R16(target))
+                    self.state = State::Execute(Operation::Add(R16(HL), R16(target)), 0);
                 }
             }
             (0o0, op, 0o2) => {
@@ -317,11 +381,14 @@ impl CPU {
                     3 => Indirect::HLD,
                     _ => unreachable!(),
                 };
-                if op & 0b1 == 0 {
-                    Operation::Load(Ind(other), R8(A))
-                } else {
-                    Operation::Load(R8(A), Ind(other))
-                }
+                self.state = State::Execute(
+                    if op & 0b1 == 0 {
+                        Operation::Load(Ind(other), R8(A))
+                    } else {
+                        Operation::Load(R8(A), Ind(other))
+                    },
+                    0,
+                );
             }
             (0o0, op, 0o3) => {
                 let target = match op >> 1 {
@@ -331,11 +398,14 @@ impl CPU {
                     3 => SP,
                     _ => unreachable!(),
                 };
-                if op & 0b1 == 0 {
-                    Operation::Inc(R16(target))
-                } else {
-                    Operation::Dec(R16(target))
-                }
+                self.state = State::Execute(
+                    if op & 0b1 == 0 {
+                        Operation::Inc(R16(target))
+                    } else {
+                        Operation::Dec(R16(target))
+                    },
+                    0,
+                );
             }
             (0o0, target, 0o4) => {
                 let target = match target {
@@ -349,7 +419,7 @@ impl CPU {
                     0o7 => R8(A),
                     _ => unreachable!(),
                 };
-                Operation::Inc(target)
+                self.state = State::Execute(Operation::Inc(target), 0);
             }
             (0o0, target, 0o5) => {
                 let target = match target {
@@ -363,7 +433,7 @@ impl CPU {
                     0o7 => R8(A),
                     _ => unreachable!(),
                 };
-                Operation::Dec(target)
+                self.state = State::Execute(Operation::Dec(target), 0);
             }
             (0o0, destination, 0o6) => {
                 let destination = match destination {
@@ -377,9 +447,19 @@ impl CPU {
                     0o7 => R8(A),
                     _ => unreachable!(),
                 };
-                let value = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                Operation::Load(destination, Imm8(value))
+                match step {
+                    0 => {
+                        self.decode_state.value = ctx.memory.read_u8(self.pc);
+                        self.tick_and_increment_pc(ctx);
+                    }
+                    1 => {
+                        self.state = State::Execute(
+                            Operation::Load(destination, Imm8(self.decode_state.value)),
+                            0,
+                        );
+                    }
+                    _ => unreachable!(),
+                }
             }
             (0o0, op @ 0o0..=0o3, 0o7) => {
                 let kind = match op >> 1 {
@@ -392,13 +472,23 @@ impl CPU {
                 } else {
                     Direction::Right
                 };
-                Operation::RotateAccumulator(kind, direction)
+                self.state = State::Execute(Operation::RotateAccumulator(kind, direction), 0);
             }
-            (0o0, 0o4, 0o7) => Operation::DecimalAdjustAccumulator,
-            (0o0, 0o5, 0o7) => Operation::ComplementAccumulator,
-            (0o0, 0o6, 0o7) => Operation::SetCarry,
-            (0o0, 0o7, 0o7) => Operation::ComplementCarry,
-            (0o1, 0o5, 0o6) => Operation::Halt,
+            (0o0, 0o4, 0o7) => {
+                self.state = State::Execute(Operation::DecimalAdjustAccumulator, 0);
+            }
+            (0o0, 0o5, 0o7) => {
+                self.state = State::Execute(Operation::ComplementAccumulator, 0);
+            }
+            (0o0, 0o6, 0o7) => {
+                self.state = State::Execute(Operation::SetCarry, 0);
+            }
+            (0o0, 0o7, 0o7) => {
+                self.state = State::Execute(Operation::ComplementCarry, 0);
+            }
+            (0o1, 0o5, 0o6) => {
+                self.state = State::Execute(Operation::Halt, 0);
+            }
             (0o1, destination @ 0o0..=0o7, source) => {
                 let destination = match destination {
                     0o0 => R8(B),
@@ -423,7 +513,7 @@ impl CPU {
                     _ => unreachable!(),
                 };
 
-                Operation::Load(destination, source)
+                self.state = State::Execute(Operation::Load(destination, source), 0);
             }
             (0o2, op, target) => {
                 let target = match target {
@@ -437,17 +527,20 @@ impl CPU {
                     7 => R8(A),
                     _ => unreachable!(),
                 };
-                match op {
-                    0 => Operation::Add(R8(A), target),
-                    1 => Operation::Adc(target),
-                    2 => Operation::Sub(target),
-                    3 => Operation::Sbc(target),
-                    4 => Operation::And(target),
-                    5 => Operation::Xor(target),
-                    6 => Operation::Or(target),
-                    7 => Operation::Compare(target),
-                    _ => unreachable!(),
-                }
+                self.state = State::Execute(
+                    match op {
+                        0 => Operation::Add(R8(A), target),
+                        1 => Operation::Adc(target),
+                        2 => Operation::Sub(target),
+                        3 => Operation::Sbc(target),
+                        4 => Operation::And(target),
+                        5 => Operation::Xor(target),
+                        6 => Operation::Or(target),
+                        7 => Operation::Compare(target),
+                        _ => unreachable!(),
+                    },
+                    0,
+                );
             }
             (0o3, condition @ 0o0..=0o3, 0o0) => {
                 use Condition::*;
@@ -458,29 +551,50 @@ impl CPU {
                     0o3 => C,
                     _ => unreachable!(),
                 };
-                Operation::Return(condition)
+                self.state = State::Execute(Operation::Return(condition), 0);
             }
-            (0o3, kind @ (0o4 | 0o6), 0o0) => {
-                let offset = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let address = u16::from_le_bytes([offset, 0xFF]);
-                match kind {
-                    0o4 => Operation::Load(Ind(Indirect::Imm16(address)), R8(A)),
-                    0o6 => Operation::Load(R8(A), Ind(Indirect::Imm16(address))),
-                    _ => unreachable!(),
+            (0o3, kind @ (0o4 | 0o6), 0o0) => match step {
+                0 => {
+                    self.decode_state.value = ctx.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc(ctx);
                 }
+                1 => {
+                    let address = u16::from_le_bytes([self.decode_state.value, 0xFF]);
+                    self.state = State::Execute(
+                        match kind {
+                            0o4 => Operation::Load(Ind(Indirect::Imm16(address)), R8(A)),
+                            0o6 => Operation::Load(R8(A), Ind(Indirect::Imm16(address))),
+                            _ => unreachable!(),
+                        },
+                        0,
+                    );
+                }
+                _ => unreachable!(),
+            },
+            (0o3, 0o5, 0o0) => match step {
+                0 => {
+                    self.decode_state.offset = ctx.memory.read_u8(self.pc) as i8;
+                    self.tick_and_increment_pc(ctx);
+                }
+                1 => {
+                    self.state = State::Execute(Operation::AddStack(self.decode_state.offset), 0);
+                }
+                _ => unreachable!(),
+            },
+            (0o3, 0o7, 0o0) => match step {
+                0 => {
+                    self.decode_state.offset = ctx.memory.read_u8(self.pc) as i8;
+                    self.tick_and_increment_pc(ctx);
+                }
+                1 => {
+                    self.state =
+                        State::Execute(Operation::LoadStackOffset(self.decode_state.offset), 0);
+                }
+                _ => unreachable!(),
+            },
+            (0o3, 0o7, 0o1) => {
+                self.state = State::Execute(Operation::Load(R16(SP), R16(HL)), 0);
             }
-            (0o3, 0o5, 0o0) => {
-                let offset = ctx.memory.read_u8(self.pc) as i8;
-                self.tick_and_increment_pc(ctx);
-                Operation::AddStack(offset)
-            }
-            (0o3, 0o7, 0o0) => {
-                let offset = ctx.memory.read_u8(self.pc) as i8;
-                self.tick_and_increment_pc(ctx);
-                Operation::LoadStackOffset(offset)
-            }
-            (0o3, 0o7, 0o1) => Operation::Load(R16(SP), R16(HL)),
             (0o3, target @ (0 | 2 | 4 | 6), kind @ (0o1 | 0o5)) => {
                 let target = match target {
                     0 => BC,
@@ -489,15 +603,24 @@ impl CPU {
                     6 => AF,
                     _ => unreachable!(),
                 };
-                match kind {
-                    0o1 => Operation::Pop(target),
-                    0o5 => Operation::Push(target),
-                    _ => unreachable!(),
-                }
+                self.state = State::Execute(
+                    match kind {
+                        0o1 => Operation::Pop(target),
+                        0o5 => Operation::Push(target),
+                        _ => unreachable!(),
+                    },
+                    0,
+                );
             }
-            (0o3, 0o1, 0o1) => Operation::Return(Condition::None),
-            (0o3, 0o3, 0o1) => Operation::ReturnInterrupt,
-            (0o3, 0o5, 0o1) => Operation::Jump(Condition::None, R16(HL)),
+            (0o3, 0o1, 0o1) => {
+                self.state = State::Execute(Operation::Return(Condition::None), 0);
+            }
+            (0o3, 0o3, 0o1) => {
+                self.state = State::Execute(Operation::ReturnInterrupt, 0);
+            }
+            (0o3, 0o5, 0o1) => {
+                self.state = State::Execute(Operation::Jump(Condition::None, R16(HL)), 0);
+            }
             (0o3, condition @ 0o0..=0o3, 0o2) => {
                 use Condition::*;
                 let condition = match condition {
@@ -507,46 +630,90 @@ impl CPU {
                     0o3 => C,
                     _ => unreachable!(),
                 };
-                let lsb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let msb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let address = u16::from_le_bytes([lsb, msb]);
-                Operation::Jump(condition, Imm16(address))
-            }
-            (0o3, op @ 0o4..=0o7, 0o2) => {
-                let dest = if op & 1 == 0 {
-                    Ind(Indirect::C)
-                } else {
-                    let lsb = ctx.memory.read_u8(self.pc);
-                    self.tick_and_increment_pc(ctx);
-                    let msb = ctx.memory.read_u8(self.pc);
-                    self.tick_and_increment_pc(ctx);
-                    let address = u16::from_le_bytes([lsb, msb]);
-                    Ind(Indirect::Imm16(address))
-                };
-                let source = R8(A);
-                match op {
-                    0o4..=0o5 => Operation::Load(dest, source),
-                    0o6..=0o7 => Operation::Load(source, dest),
+                match step {
+                    0 => {
+                        self.decode_state.lsb = ctx.memory.read_u8(self.pc);
+                        self.tick_and_increment_pc(ctx);
+                    }
+                    1 => {
+                        self.decode_state.msb = ctx.memory.read_u8(self.pc);
+                        self.tick_and_increment_pc(ctx);
+                    }
+                    2 => {
+                        let address =
+                            u16::from_le_bytes([self.decode_state.lsb, self.decode_state.msb]);
+                        self.state = State::Execute(Operation::Jump(condition, Imm16(address)), 0);
+                    }
                     _ => unreachable!(),
                 }
             }
-            (0o3, 0o0, 0o3) => {
-                let lsb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let msb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let address = u16::from_le_bytes([lsb, msb]);
-                Operation::Jump(Condition::None, Imm16(address))
+            (0o3, op @ 0o4..=0o7, 0o2) => {
+                let source = R8(A);
+
+                if op & 1 == 0 {
+                    let dest = Ind(Indirect::C);
+                    self.state = State::Execute(
+                        match op {
+                            0o4..=0o5 => Operation::Load(dest, source),
+                            0o6..=0o7 => Operation::Load(source, dest),
+                            _ => unreachable!(),
+                        },
+                        0,
+                    );
+                    return;
+                } else {
+                    match step {
+                        0 => {
+                            self.decode_state.lsb = ctx.memory.read_u8(self.pc);
+                            self.tick_and_increment_pc(ctx);
+                        }
+                        1 => {
+                            self.decode_state.msb = ctx.memory.read_u8(self.pc);
+                            self.tick_and_increment_pc(ctx);
+                        }
+                        2 => {
+                            let address =
+                                u16::from_le_bytes([self.decode_state.lsb, self.decode_state.msb]);
+                            let dest = Ind(Indirect::Imm16(address));
+                            self.state = State::Execute(
+                                match op {
+                                    0o4..=0o5 => Operation::Load(dest, source),
+                                    0o6..=0o7 => Operation::Load(source, dest),
+                                    _ => unreachable!(),
+                                },
+                                0,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                };
             }
+            (0o3, 0o0, 0o3) => match step {
+                0 => {
+                    self.decode_state.lsb = ctx.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc(ctx);
+                }
+                1 => {
+                    self.decode_state.msb = ctx.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc(ctx);
+                }
+                2 => {
+                    let address =
+                        u16::from_le_bytes([self.decode_state.lsb, self.decode_state.msb]);
+                    self.state =
+                        State::Execute(Operation::Jump(Condition::None, Imm16(address)), 0);
+                }
+                _ => unreachable!(),
+            },
             (0o3, 0o1, 0o3) => self.fetch_cb_operation(ctx),
             (0o3, 0o2..=0o5, 0o3) => {
                 error!("Invalid opcode");
                 todo!("Decide what to do on invalid opcode")
             }
-            (0o3, 0o6, 0o3) => Operation::DisableInterrupt,
-            (0o3, 0o7, 0o3) => Operation::EnableInterrupt,
+            (0o3, 0o6, 0o3) => {
+                self.state = State::Execute(Operation::DisableInterrupt, 0);
+            }
+            (0o3, 0o7, 0o3) => self.state = State::Execute(Operation::EnableInterrupt, 0),
             (0o3, condition @ 0o0..=0o3, 0o4) => {
                 use Condition::*;
                 let condition = match condition {
@@ -556,45 +723,70 @@ impl CPU {
                     0o3 => C,
                     _ => unreachable!(),
                 };
-                let lsb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let msb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let address = u16::from_le_bytes([lsb, msb]);
-                Operation::Call(condition, Imm16(address))
+                match step {
+                    0 => {
+                        self.decode_state.lsb = ctx.memory.read_u8(self.pc);
+                        self.tick_and_increment_pc(ctx);
+                    }
+                    1 => {
+                        self.decode_state.msb = ctx.memory.read_u8(self.pc);
+                        self.tick_and_increment_pc(ctx);
+                    }
+                    2 => {
+                        let address =
+                            u16::from_le_bytes([self.decode_state.lsb, self.decode_state.msb]);
+                        self.state = State::Execute(Operation::Call(condition, Imm16(address)), 0);
+                    }
+                    _ => unreachable!(),
+                }
             }
             (0o3, 0o4..=0o7, 0o4) => {
                 error!("Invalid opcode");
                 todo!("Decide what to do on invalid opcode")
             }
-            (0o3, 0o1, 0o5) => {
-                let lsb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let msb = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let address = u16::from_le_bytes([lsb, msb]);
-                Operation::Call(Condition::None, Imm16(address))
-            }
+            (0o3, 0o1, 0o5) => match step {
+                0 => {
+                    self.decode_state.lsb = ctx.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc(ctx);
+                }
+                1 => {
+                    self.decode_state.msb = ctx.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc(ctx);
+                }
+                2 => {
+                    let address =
+                        u16::from_le_bytes([self.decode_state.lsb, self.decode_state.msb]);
+                    self.state =
+                        State::Execute(Operation::Call(Condition::None, Imm16(address)), 0);
+                }
+                _ => unreachable!(),
+            },
             (0o3, 0o3 | 0o5 | 0o7, 0o5) => {
                 error!("Invalid opcode");
                 todo!("Decide what to do on invalid opcode")
             }
-            (0o3, kind @ 0o0..=0o7, 0o6) => {
-                let value = ctx.memory.read_u8(self.pc);
-                self.tick_and_increment_pc(ctx);
-                let operation = match kind {
-                    0o0 => |value| Operation::Add(R8(A), value),
-                    0o1 => Operation::Adc,
-                    0o2 => Operation::Sub,
-                    0o3 => Operation::Sbc,
-                    0o4 => Operation::And,
-                    0o5 => Operation::Xor,
-                    0o6 => Operation::Or,
-                    0o7 => Operation::Compare,
-                    _ => unreachable!(),
-                };
-                operation(Target::Imm8(value))
-            }
+            (0o3, kind @ 0o0..=0o7, 0o6) => match step {
+                0 => {
+                    self.decode_state.value = ctx.memory.read_u8(self.pc);
+                    self.tick_and_increment_pc(ctx);
+                }
+                1 => {
+                    let operation = match kind {
+                        0o0 => |value| Operation::Add(R8(A), value),
+                        0o1 => Operation::Adc,
+                        0o2 => Operation::Sub,
+                        0o3 => Operation::Sbc,
+                        0o4 => Operation::And,
+                        0o5 => Operation::Xor,
+                        0o6 => Operation::Or,
+                        0o7 => Operation::Compare,
+                        _ => unreachable!(),
+                    };
+                    self.state =
+                        State::Execute(operation(Target::Imm8(self.decode_state.value)), 0);
+                }
+                _ => unreachable!(),
+            },
             (0o3, variant @ 0o0..=0o7, 0o7) => {
                 let lsb = match variant {
                     0o0 => 0x00,
@@ -608,44 +800,67 @@ impl CPU {
                     _ => unreachable!(),
                 };
                 let address = u16::from_le_bytes([lsb, 0x00]);
-                Operation::Restart(address)
+                self.state = State::Execute(Operation::Restart(address), 0);
             }
             (0o4.., _, _) | (_, 0o10.., _) | (_, _, 0o10..) => unreachable!(),
         }
+        if let State::Decode(step) = &mut self.state {
+            *step += 1;
+        }
     }
 
-    pub(crate) fn fetch_cb_operation(&mut self, ctx: &mut Context) -> Operation {
+    pub(crate) fn fetch_cb_operation(&mut self, ctx: &mut Context) {
         use Registers8::*;
         use Registers16::*;
         use Target::*;
-        let (operation, target) = decompose_octal_cb(ctx.memory.read_u8(self.pc));
-        self.tick_and_increment_pc(ctx);
 
-        let target = match target {
-            0o0 => R8(B),
-            0o1 => R8(C),
-            0o2 => R8(D),
-            0o3 => R8(E),
-            0o4 => R8(H),
-            0o5 => R8(L),
-            0o6 => Ind(Indirect::R16(HL)),
-            0o7 => R8(A),
-            _ => unreachable!(),
+        let State::Decode(step) = self.state else {
+            unreachable!()
         };
 
-        match operation {
-            0o0 => Operation::Rotate(RotationType::Circular, Direction::Left, target),
-            0o1 => Operation::Rotate(RotationType::Circular, Direction::Right, target),
-            0o2 => Operation::Rotate(RotationType::NonCircular, Direction::Left, target),
-            0o3 => Operation::Rotate(RotationType::NonCircular, Direction::Right, target),
-            0o4 => Operation::ShiftArithmetic(Direction::Left, target),
-            0o5 => Operation::ShiftArithmetic(Direction::Right, target),
-            0o6 => Operation::Swap(target),
-            0o7 => Operation::ShiftRightLogical(target),
-            number @ 0o10..=0o17 => Operation::TestBit(number - 0o10, target),
-            number @ 0o20..=0o27 => Operation::ResetBit(number - 0o20, target),
-            number @ 0o30..=0o37 => Operation::SetBit(number - 0o30, target),
-            0o40.. => unreachable!(),
+        match step {
+            0 => {
+                self.decode_state.value = ctx.memory.read_u8(self.pc);
+                self.tick_and_increment_pc(ctx);
+            }
+            1 => {
+                let (operation, target) = decompose_octal_cb(self.decode_state.value);
+
+                let target = match target {
+                    0o0 => R8(B),
+                    0o1 => R8(C),
+                    0o2 => R8(D),
+                    0o3 => R8(E),
+                    0o4 => R8(H),
+                    0o5 => R8(L),
+                    0o6 => Ind(Indirect::R16(HL)),
+                    0o7 => R8(A),
+                    _ => unreachable!(),
+                };
+
+                self.state = State::Execute(
+                    match operation {
+                        0o0 => Operation::Rotate(RotationType::Circular, Direction::Left, target),
+                        0o1 => Operation::Rotate(RotationType::Circular, Direction::Right, target),
+                        0o2 => {
+                            Operation::Rotate(RotationType::NonCircular, Direction::Left, target)
+                        }
+                        0o3 => {
+                            Operation::Rotate(RotationType::NonCircular, Direction::Right, target)
+                        }
+                        0o4 => Operation::ShiftArithmetic(Direction::Left, target),
+                        0o5 => Operation::ShiftArithmetic(Direction::Right, target),
+                        0o6 => Operation::Swap(target),
+                        0o7 => Operation::ShiftRightLogical(target),
+                        number @ 0o10..=0o17 => Operation::TestBit(number - 0o10, target),
+                        number @ 0o20..=0o27 => Operation::ResetBit(number - 0o20, target),
+                        number @ 0o30..=0o37 => Operation::SetBit(number - 0o30, target),
+                        0o40.. => unreachable!(),
+                    },
+                    0,
+                );
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -1211,6 +1426,9 @@ impl CPU {
                     _ => unimplemented!("Invalid target for operation"),
                 }
             }
+        }
+        if let State::Execute(_, step) = &mut self.state {
+            *step += 1;
         }
     }
 
