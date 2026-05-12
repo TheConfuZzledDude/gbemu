@@ -1,4 +1,5 @@
 use better_default::Default;
+use tracing::debug;
 
 use crate::ppu::{LCDRegisters, Oam, Vram};
 
@@ -22,11 +23,11 @@ pub(crate) struct JoypadRegister;
 
 impl JoypadRegister {
     pub(crate) fn read(&self) -> u8 {
-        todo!()
+        0xFF // todo!()
     }
 
     pub(crate) fn write(&mut self, _value: u8) {
-        todo!()
+        // todo!()
     }
 }
 
@@ -35,11 +36,12 @@ pub(crate) struct SerialTransferRegisters;
 
 impl SerialTransferRegisters {
     pub(crate) fn read(&self, _address: u8) -> u8 {
-        todo!()
+        // todo!()
+        0xFF
     }
 
     pub(crate) fn write(&mut self, _address: u8, _value: u8) {
-        todo!()
+        //todo!()
     }
 }
 
@@ -182,35 +184,33 @@ impl Interrupts {
     }
 }
 
+fn unimplemented() -> u8 {
+    0xFF
+}
+
 impl IoRegisters {
     pub(crate) fn read_u8(&self, address: u8) -> u8 {
         match address {
             0x00 => self.joypad.read(),
             0x01..=0x02 => self.serial.read(address),
-            0x03 => unimplemented!(),
+            0x03 => unimplemented(),
             0x04..=0x07 => self.timer.read(address),
             0x08..0x0F => unimplemented!(),
             0x0F => self.interrupt.read(),
-            0x10..=0x26 => {
-                //TODO: AUDIO
-                0xFF
-            }
+            0x10..=0x26 => unimplemented(),
             0x27..0x30 => unimplemented!(),
-            0x30..=0x3F => {
-                //TODO: WAVE PATTERN
-                0xFF
-            }
-            0x40..=0x4B => {
-                //TODO: LCD/OAM
-                0x90
-            }
+            0x30..=0x3F => unimplemented(),
+            0x40..=0x4B => self.lcd.read(address),
 
             0x50 => {
                 // Bootrom bank control, write-only
                 0xFF
             }
             0x80.. => unreachable!(),
-            _ => unimplemented!("CGB/unused IO address"),
+            _ => {
+                debug!("CGB/unused IO address: {address}");
+                unimplemented()
+            }
         }
     }
 
@@ -235,7 +235,9 @@ impl IoRegisters {
                 // Bootrom bank control, write-only
             }
             0x80.. => unreachable!(),
-            _ => unimplemented!("CGB/unused IO address"),
+            _ => {
+                debug!("CGB/unused IO address: {address}")
+            }
         }
     }
 }
@@ -276,11 +278,9 @@ impl MemoryBus {
                 //Echo RAM
                 self.wram1[address as usize - 0xE000]
             }
-            0xFE00..=0xFE9F => {
-                todo!("Implement OAM")
-            }
+            0xFE00..=0xFE9F => self.oam[address as usize - 0xFE00],
             0xFEA0..=0xFEFF => {
-                todo!("Prohibited region, implement undefined behaviour")
+                0xFF // todo!("Prohibited region, implement undefined behaviour")
             }
             0xFF00..=0xFF7F => self.io.read_u8(address as u8),
             0xFF80..=0xFFFE => self.hram[address as usize - 0xFF80],
@@ -303,11 +303,9 @@ impl MemoryBus {
                 //Echo RAM
                 self.wram1[address as usize - 0xE000] = value
             }
-            0xFE00..=0xFE9F => {
-                todo!("Implement OAM")
-            }
+            0xFE00..=0xFE9F => self.oam[address as usize - 0xFE00] = value,
             0xFEA0..=0xFEFF => {
-                todo!("Prohibited region, implement undefined behaviour")
+                // todo!("Prohibited region, implement undefined behaviour")
             }
             0xFF00..=0xFF7F => {
                 self.io.write_u8(address as u8, value);

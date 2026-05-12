@@ -148,7 +148,7 @@ pub(crate) struct LCDRegisters {
     stat: Stat,
     scy: u8,
     scx: u8,
-    ly: u8,
+    pub(crate) ly: u8,
     lyc: u8,
     dma: u8,
     bgp: u8,
@@ -234,13 +234,17 @@ enum ObjSize {
 #[derive(Copy, Clone, Debug, FromRepr)]
 #[repr(u8)]
 enum TileDataMapping {
-    Zero,
-    One,
+    Zero = 1,
+    One = 0,
 }
 
 const VRAM_BASE_ADDRESS: usize = 0x8000;
 
 impl Vram {
+    pub(crate) fn tile_data(&self) -> &[u8] {
+        &self.0[0x8000 - VRAM_BASE_ADDRESS..=0x97FF - VRAM_BASE_ADDRESS]
+    }
+
     fn tile_map(&self, index: TileMapArea) -> &[u8] {
         &self.0[Self::get_tile_map_range(index)]
     }
@@ -429,8 +433,9 @@ impl OamEntry {
     }
 }
 
-#[derive(Copy, Clone, Debug, FromRepr, PartialEq, Eq)]
-enum Mode {
+#[derive(Copy, Clone, Debug, FromRepr, PartialEq, Eq, Default)]
+pub(crate) enum Mode {
+    #[default]
     OamScan = 2,
     PixelTransfer = 3,
 
@@ -445,9 +450,10 @@ struct SpritePixel {
     priority: bool,
 }
 
-#[derive(Debug, Clone, Copy, FromRepr)]
+#[derive(Debug, Clone, Copy, FromRepr, Default)]
 #[repr(u8)]
-enum Pixel {
+pub(crate) enum Pixel {
+    #[default]
     White = 0,
     LightGray,
     DarkGrey,
@@ -469,22 +475,27 @@ enum PixelSource {
 }
 
 // Reference for PPU details: https://www.youtube.com/watch?v=HyzD8pNlpwI&t=1760s
-struct PPU {
-    cycle_counter: u32,
-    current_mode: Mode,
+#[derive(Default)]
+pub(crate) struct PPU {
+    pub(crate) cycle_counter: u32,
+    pub(crate) current_mode: Mode,
     obj_buffer: StackArrayDeque<OamEntry, 10>,
+    #[default(ArrayDeque::new(40))]
     oam_copy: ArrayDeque<OamEntry>,
-    bg_fifo: StackArrayDeque<u8, 16>,
+    bg_fifo: StackArrayDeque<u8, 8>,
     sprite_fifo: StackArrayDeque<SpritePixel, 8>,
     bg_fetcher_state: BgFetcherState,
     sprite_fetcher_state: SpriteFetcherState,
     screen_x: u8,
     scx_counter: u8,
+    #[default(ArrayDeque::new(10))]
     sprites_to_fetch: ArrayDeque<(usize, OamEntry)>,
     fetching_sprite: Option<OamEntry>,
     oam_index: usize,
-    screen: [Pixel; 160 * 144],
+    #[default([Default::default(); 160*144])]
+    pub(crate) screen: [Pixel; 160 * 144],
     stat_interrupt_line: bool,
+    first_tile_fetch: bool,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -519,10 +530,16 @@ impl SpriteFetcherState {
 }
 
 impl PPU {
-    fn tick(&mut self, ctx: &mut Context) {
+    pub(crate) fn tick(&mut self, ctx: &mut Context) {
         match self.current_mode {
-            Mode::OamScan => self.oam_scan(ctx),
-            Mode::PixelTransfer => self.pixel_transfer(ctx),
+            Mode::OamScan => {
+                self.oam_scan(ctx);
+                self.cycle_counter += 1;
+            }
+            Mode::PixelTransfer => {
+                self.pixel_transfer(ctx);
+                self.cycle_counter += 1;
+            }
             Mode::HBlank => {
                 if self.cycle_counter == 455 {
                     if ctx.memory.io.lcd.ly == 143 {
@@ -532,6 +549,8 @@ impl PPU {
                     }
                     ctx.memory.io.lcd.ly += 1;
                     self.cycle_counter = 0;
+                } else {
+                    self.cycle_counter += 1;
                 }
             }
             Mode::VBlank => {
@@ -548,11 +567,13 @@ impl PPU {
                         ctx.memory.io.lcd.ly = 0;
                     } else {
                         ctx.memory.io.lcd.ly += 1;
+                        self.cycle_counter = 0;
                     }
+                } else {
+                    self.cycle_counter += 1;
                 }
             }
         };
-        self.cycle_counter += 1;
         ctx.memory
             .io
             .lcd
@@ -603,6 +624,7 @@ impl PPU {
         if self.cycle_counter == 80 {
             self.screen_x = 0;
             self.scx_counter = ctx.memory.io.lcd.scx % 8;
+            self.first_tile_fetch = true;
         }
         if self.sprites_to_fetch.is_empty() {
             self.sprites_to_fetch = self
@@ -620,7 +642,7 @@ impl PPU {
                 self.bg_fetch(ctx);
             }
         }
-        if self.bg_fifo.len() > 8 && self.sprites_to_fetch.is_empty() {
+        if !self.bg_fifo.is_empty() && self.sprites_to_fetch.is_empty() {
             if self.scx_counter > 0 {
                 self.bg_fifo.pop_front();
                 self.scx_counter -= 1;
@@ -644,12 +666,14 @@ impl PPU {
                     Pixel::from_repr((ctx.memory.io.lcd.bgp >> (bg_palette_index * 2)) & 0b11)
                         .unwrap()
                 };
-                self.screen[ctx.memory.io.lcd.ly as usize * 144 + self.screen_x as usize] = colour;
+                self.screen[ctx.memory.io.lcd.ly as usize * 160 + self.screen_x as usize] = colour;
                 self.screen_x += 1;
                 if self.screen_x == 160 {
                     self.current_mode = Mode::HBlank;
                     self.bg_fetcher_state.clear();
                     self.sprite_fetcher_state.clear();
+                    self.bg_fifo.clear();
+                    self.sprite_fifo.clear();
                 }
             }
         }
@@ -665,6 +689,9 @@ impl PPU {
         match (tile_no, data_low, data_high) {
             (None, _, _) => {
                 self.fetch_bg_tile(ctx);
+                if self.first_tile_fetch {
+                    self.first_tile_fetch = false;
+                }
             }
             (Some(tile_no), data_low @ None, _) => {
                 *data_low = Some(
@@ -687,7 +714,7 @@ impl PPU {
         if let (Some(low), Some(high)) = (
             self.bg_fetcher_state.data_low,
             self.bg_fetcher_state.data_high,
-        ) && self.bg_fifo.len() <= 8
+        ) && self.bg_fifo.is_empty()
         {
             let tile_row = u16::from_le_bytes([low, high]);
             for n in 0..8 {
@@ -725,7 +752,9 @@ impl PPU {
     // }
 
     fn fetch_bg_tile(&mut self, ctx: &mut Context) {
-        let in_window = self.screen_x >= ctx.memory.io.lcd.wx
+        let first_fetch_offset = if self.first_tile_fetch { 0u8 } else { 8u8 };
+        let in_window = false
+            && self.screen_x >= ctx.memory.io.lcd.wx
             && ctx.memory.io.lcd.ly >= ctx.memory.io.lcd.wy
             && ctx.memory.io.lcd.lcdc.window_enable();
         let tile_map_area = if !in_window {
@@ -734,7 +763,9 @@ impl PPU {
             ctx.memory.io.lcd.lcdc.window_tile_map()
         };
         let tile_x = if !in_window {
-            self.screen_x.wrapping_add(ctx.memory.io.lcd.scx)
+            self.screen_x
+                .wrapping_add(ctx.memory.io.lcd.scx)
+                .wrapping_add(first_fetch_offset)
         } else {
             self.screen_x - ctx.memory.io.lcd.wx
         };
@@ -744,7 +775,7 @@ impl PPU {
             ctx.memory.io.lcd.ly - ctx.memory.io.lcd.wy
         };
         self.bg_fetcher_state.tile_line = tile_y % 8;
-        let tile_map_index = ((tile_y as u16) / 8) << 5 | (tile_x as u16 / 8);
+        let tile_map_index = (((tile_y as u16) / 8) << 5) | (tile_x as u16 / 8);
         self.bg_fetcher_state.tile_no =
             Some(ctx.memory.vram.tile_map(tile_map_area)[tile_map_index as usize]);
     }
@@ -850,7 +881,12 @@ impl PPU {
 
     fn fetch_sprite_tile(&mut self, ctx: &mut Context) {
         if let Some((oam_index, current_sprite)) = self.sprites_to_fetch.front() {
-            self.sprite_fetcher_state.tile_line = ctx.memory.io.lcd.ly - (current_sprite.y() + 16);
+            self.sprite_fetcher_state.tile_line = ctx
+                .memory
+                .io
+                .lcd
+                .ly
+                .wrapping_sub(current_sprite.y().wrapping_sub(16));
             self.sprite_fetcher_state.tile_no = Some(current_sprite.tile_index());
             self.sprite_fetcher_state.oam_index = *oam_index;
             self.sprite_fetcher_state.priority = current_sprite.attributes().priority();
