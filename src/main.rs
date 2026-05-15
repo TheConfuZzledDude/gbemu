@@ -24,12 +24,11 @@ use tap::Pipe;
 use tracing::{debug, info, level_filters::LevelFilter};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::{context::Context, ppu::Mode};
-
-pub(crate) mod clock;
-pub(crate) mod context;
-pub(crate) mod cpu;
-pub(crate) mod ppu;
+use gbemu::{
+    context::{Context, Memory, MemoryBus},
+    cpu,
+    ppu::{self, Mode},
+};
 
 fn main() -> iced::Result {
     let format = fmt::format()
@@ -311,8 +310,8 @@ impl<Message> canvas::Program<Message> for TileViewer {
 struct GameBoy {
     buffer: BytesMut,
     cache: Cache,
-    context: Context,
-    cpu: cpu::CPU,
+    context: Context<MemoryBus>,
+    cpu: cpu::CPU<MemoryBus>,
     ppu: ppu::PPU,
     counter: u64,
 }

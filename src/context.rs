@@ -10,16 +10,16 @@ pub(crate) type Memory8K = [u8; 1024 * 8];
 pub(crate) type Memory4K = [u8; 1024 * 4];
 
 #[derive(Default)]
-pub(crate) struct IoRegisters {
-    pub(crate) joypad: JoypadRegister,
-    pub(crate) serial: SerialTransferRegisters,
-    pub(crate) timer: TimerRegisters,
-    pub(crate) interrupt: Interrupts,
-    pub(crate) lcd: LCDRegisters,
+pub struct IoRegisters {
+    pub joypad: JoypadRegister,
+    pub serial: SerialTransferRegisters,
+    pub timer: Timer,
+    pub interrupt: InterruptFlag,
+    pub lcd: LCDRegisters,
 }
 
 #[derive(Default)]
-pub(crate) struct JoypadRegister;
+pub struct JoypadRegister;
 
 impl JoypadRegister {
     pub(crate) fn read(&self) -> u8 {
@@ -32,7 +32,7 @@ impl JoypadRegister {
 }
 
 #[derive(Default)]
-pub(crate) struct SerialTransferRegisters;
+pub struct SerialTransferRegisters;
 
 impl SerialTransferRegisters {
     pub(crate) fn read(&self, _address: u8) -> u8 {
@@ -46,7 +46,7 @@ impl SerialTransferRegisters {
 }
 
 #[derive(Default)]
-pub(crate) struct TimerRegisters {
+pub struct Timer {
     pub(crate) sc: u16,
     pub(crate) tima: u8,
     pub(crate) tma: u8,
@@ -55,7 +55,7 @@ pub(crate) struct TimerRegisters {
     pub(crate) tima_written: bool,
 }
 
-impl TimerRegisters {
+impl Timer {
     pub(crate) fn read(&self, address: u8) -> u8 {
         match address {
             0x00..=0x03 => unreachable!(),
@@ -144,7 +144,7 @@ impl TimerRegisters {
         }
     }
 
-    pub(crate) fn handle_overflow(&mut self, tma: u8, interrupts: &mut Interrupts) {
+    pub(crate) fn handle_overflow(&mut self, tma: u8, interrupts: &mut impl InterruptRegister) {
         self.tima = tma;
 
         // TODO: Schedule interrupt here
@@ -152,14 +152,26 @@ impl TimerRegisters {
     }
 }
 
+impl TimerRegisters for Timer {
+    fn tick(&mut self, interrupts: &mut impl InterruptRegister) {
+        self.tima_written = false;
+        let tima_overflow = self.tima_overflow;
+        self.tima_overflow = None;
+        self.clock_tick();
+        if let Some(tma) = tima_overflow {
+            self.handle_overflow(tma, interrupts);
+        }
+    }
+}
+
 #[derive(Default)]
-pub(crate) struct Interrupts {
+pub struct InterruptFlag {
     pub(crate) interrupt_flag: u8,
 }
 
 #[derive(Debug, Copy, Clone)]
 #[repr(u8)]
-pub(crate) enum InterruptType {
+pub enum InterruptType {
     Joypad = 4,
     Serial = 3,
     Timer = 2,
@@ -167,19 +179,19 @@ pub(crate) enum InterruptType {
     VBlank = 0,
 }
 
-impl Interrupts {
-    pub(crate) fn read(&self) -> u8 {
+impl InterruptRegister for InterruptFlag {
+    fn read(&self) -> u8 {
         self.interrupt_flag
     }
-    pub(crate) fn write(&mut self, value: u8) {
+    fn write(&mut self, value: u8) {
         self.interrupt_flag = value;
     }
 
-    pub(crate) fn schedule_interrupt(&mut self, interrupt: InterruptType) {
+    fn schedule_interrupt(&mut self, interrupt: InterruptType) {
         self.interrupt_flag |= 1 << (interrupt as u8);
     }
 
-    pub(crate) fn clear_interrupt(&mut self, interrupt: InterruptType) {
+    fn clear_interrupt(&mut self, interrupt: InterruptType) {
         self.interrupt_flag &= !(1 << (interrupt as u8));
     }
 }
@@ -243,12 +255,12 @@ impl IoRegisters {
 }
 
 #[derive(Default)]
-pub(crate) struct MemoryBus {
+pub struct MemoryBus {
     #[default([0; 1024*16])]
     pub(crate) rom: Memory16K,
     #[default(vec![[0; 1024*16]])]
     pub(crate) rom_banks: Vec<Memory16K>,
-    pub(crate) vram: Vram,
+    pub vram: Vram,
     #[default([0; 1024 * 8])]
     pub(crate) external_ram: Memory8K,
     #[default([0; 1024 * 4])]
@@ -256,14 +268,14 @@ pub(crate) struct MemoryBus {
     #[default([0; 1024 * 4])]
     pub(crate) wram2: Memory4K,
     pub(crate) oam: Oam,
-    pub(crate) io: IoRegisters,
+    pub io: IoRegisters,
     #[default([0; 0xFFFF-0xFF80])]
     pub(crate) hram: [u8; 0xFFFF - 0xFF80],
     pub(crate) ie: u8,
 }
 
 impl MemoryBus {
-    pub(crate) fn read_u8(&self, address: u16) -> u8 {
+    pub fn read_u8(&self, address: u16) -> u8 {
         match address {
             0x0000..=0x3FFF => self.rom[address as usize],
             0x4000..=0x7FFF => {
@@ -274,13 +286,17 @@ impl MemoryBus {
             0xA000..=0xBFFF => self.external_ram[address as usize - 0xA000],
             0xC000..=0xCFFF => self.wram1[address as usize - 0xC000],
             0xD000..=0xDFFF => self.wram2[address as usize - 0xD000],
-            0xE000..=0xFDFF => {
+            0xE000..=0xEFFF => {
                 //Echo RAM
                 self.wram1[address as usize - 0xE000]
             }
+            0xF000..=0xFDFF => {
+                //Echo RAM 2
+                self.wram2[address as usize - 0xF000]
+            }
             0xFE00..=0xFE9F => self.oam[address as usize - 0xFE00],
             0xFEA0..=0xFEFF => {
-                0xFF // todo!("Prohibited region, implement undefined behaviour")
+                0x00 // Prohibited Region, on DMG reads return $00
             }
             0xFF00..=0xFF7F => self.io.read_u8(address as u8),
             0xFF80..=0xFFFE => self.hram[address as usize - 0xFF80],
@@ -288,7 +304,7 @@ impl MemoryBus {
         }
     }
 
-    pub(crate) fn set_u8(&mut self, address: u16, value: u8) {
+    pub fn write_u8(&mut self, address: u16, value: u8) {
         match address {
             0x0000..=0x3FFF => self.rom[address as usize] = value,
             0x4000..=0x7FFF => {
@@ -299,9 +315,13 @@ impl MemoryBus {
             0xA000..=0xBFFF => self.external_ram[address as usize - 0xA000] = value,
             0xC000..=0xCFFF => self.wram1[address as usize - 0xC000] = value,
             0xD000..=0xDFFF => self.wram2[address as usize - 0xD000] = value,
-            0xE000..=0xFDFF => {
+            0xE000..=0xEFFF => {
                 //Echo RAM
                 self.wram1[address as usize - 0xE000] = value
+            }
+            0xF000..=0xFDFF => {
+                //Echo RAM 2
+                self.wram2[address as usize - 0xF000] = value
             }
             0xFE00..=0xFE9F => self.oam[address as usize - 0xFE00] = value,
             0xFEA0..=0xFEFF => {
@@ -317,6 +337,172 @@ impl MemoryBus {
 }
 
 #[derive(Default)]
-pub(crate) struct Context {
-    pub(crate) memory: MemoryBus,
+pub struct Context<M: Memory + Default> {
+    pub memory: M,
+}
+
+pub trait Memory {
+    fn read_u8(&self, address: u16) -> u8;
+    fn write_u8(&mut self, address: u16, value: u8);
+
+    fn io(&self) -> &impl Io;
+    fn io_mut(&mut self) -> &mut impl Io;
+
+    fn ie(&self) -> &u8;
+    fn ie_mut(&mut self) -> &mut u8;
+
+    fn load_boot_rom(&mut self, rom: &[u8]);
+    fn load_rom(&mut self, rom: &[u8]);
+}
+
+impl Memory for MemoryBus {
+    fn read_u8(&self, address: u16) -> u8 {
+        self.read_u8(address)
+    }
+
+    fn write_u8(&mut self, address: u16, value: u8) {
+        self.write_u8(address, value);
+    }
+
+    fn io(&self) -> &impl Io {
+        &self.io
+    }
+
+    fn io_mut(&mut self) -> &mut impl Io {
+        &mut self.io
+    }
+
+    fn ie(&self) -> &u8 {
+        &self.ie
+    }
+
+    fn ie_mut(&mut self) -> &mut u8 {
+        &mut self.ie
+    }
+
+    fn load_boot_rom(&mut self, rom: &[u8]) {
+        self.rom[..rom.len()].copy_from_slice(rom);
+    }
+
+    fn load_rom(&mut self, rom: &[u8]) {
+        self.rom.copy_from_slice(&rom[..1024 * 16]);
+        self.rom_banks[0].copy_from_slice(&rom[1024 * 16..]);
+    }
+}
+
+pub trait Io {
+    fn timer(&self) -> &impl TimerRegisters;
+    fn timer_mut(&mut self) -> &mut impl TimerRegisters;
+
+    fn interrupt_flag(&self) -> &impl InterruptRegister;
+    fn interrupt_flag_mut(&mut self) -> &mut impl InterruptRegister;
+}
+
+impl Io for IoRegisters {
+    fn timer(&self) -> &impl TimerRegisters {
+        &self.timer
+    }
+
+    fn timer_mut(&mut self) -> &mut impl TimerRegisters {
+        &mut self.timer
+    }
+
+    fn interrupt_flag(&self) -> &impl InterruptRegister {
+        &self.interrupt
+    }
+
+    fn interrupt_flag_mut(&mut self) -> &mut impl InterruptRegister {
+        &mut self.interrupt
+    }
+}
+
+pub trait TimerRegisters {
+    fn tick(&mut self, interrupts: &mut impl InterruptRegister);
+}
+
+pub trait InterruptRegister {
+    fn read(&self) -> u8;
+    fn write(&mut self, value: u8);
+
+    fn schedule_interrupt(&mut self, interrupt: InterruptType);
+
+    fn clear_interrupt(&mut self, interrupt: InterruptType);
+}
+
+pub struct FlatMemory([u8; 64 * 1024]);
+impl Default for FlatMemory {
+    fn default() -> Self {
+        Self([0; 64 * 1024])
+    }
+}
+impl Memory for FlatMemory {
+    fn read_u8(&self, address: u16) -> u8 {
+        self.0[address as usize]
+    }
+
+    fn write_u8(&mut self, address: u16, value: u8) {
+        self.0[address as usize] = value;
+    }
+
+    fn io(&self) -> &impl Io {
+        self
+    }
+
+    fn io_mut(&mut self) -> &mut impl Io {
+        self
+    }
+
+    fn ie(&self) -> &u8 {
+        &self.0[0xFFFF]
+    }
+
+    fn ie_mut(&mut self) -> &mut u8 {
+        &mut self.0[0xFFFF]
+    }
+
+    fn load_boot_rom(&mut self, rom: &[u8]) {
+        todo!()
+    }
+
+    fn load_rom(&mut self, rom: &[u8]) {
+        todo!()
+    }
+}
+
+impl Io for FlatMemory {
+    fn timer(&self) -> &impl TimerRegisters {
+        self
+    }
+
+    fn timer_mut(&mut self) -> &mut impl TimerRegisters {
+        self
+    }
+
+    fn interrupt_flag(&self) -> &impl InterruptRegister {
+        self
+    }
+
+    fn interrupt_flag_mut(&mut self) -> &mut impl InterruptRegister {
+        self
+    }
+}
+impl TimerRegisters for FlatMemory {
+    fn tick(&mut self, interrupts: &mut impl InterruptRegister) {}
+}
+
+impl InterruptRegister for FlatMemory {
+    fn read(&self) -> u8 {
+        self.0[0xFF0F]
+    }
+    fn write(&mut self, value: u8) {
+        self.0[0xFF0F] = value;
+    }
+
+    fn schedule_interrupt(&mut self, interrupt: InterruptType) {
+        self.0[0xFF0F] |= 1 << (interrupt as u8);
+    }
+
+    fn clear_interrupt(&mut self, interrupt: InterruptType) {
+        self.0[0xFF0F] &= !(1 << (interrupt as u8));
+    }
 }

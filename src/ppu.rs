@@ -8,7 +8,7 @@ use core::{
 };
 use std::process::Output;
 
-use crate::context::{Context, Memory8K};
+use crate::context::{Context, InterruptRegister, Io, Memory, Memory8K, MemoryBus};
 use array_deque::{ArrayDeque, StackArrayDeque};
 use better_default::Default;
 use bytemuck::TransparentWrapper;
@@ -143,12 +143,12 @@ impl Stat {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct LCDRegisters {
+pub struct LCDRegisters {
     lcdc: Lcdc,
     stat: Stat,
     scy: u8,
     scx: u8,
-    pub(crate) ly: u8,
+    pub ly: u8,
     lyc: u8,
     dma: u8,
     bgp: u8,
@@ -201,7 +201,7 @@ impl LCDRegisters {
 
 #[repr(transparent)]
 #[derive(Default)]
-pub(crate) struct Vram(#[default([0; 1024 * 8])] Memory8K);
+pub struct Vram(#[default([0; 1024 * 8])] Memory8K);
 
 impl DerefMut for Vram {
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -241,7 +241,7 @@ enum TileDataMapping {
 const VRAM_BASE_ADDRESS: usize = 0x8000;
 
 impl Vram {
-    pub(crate) fn tile_data(&self) -> &[u8] {
+    pub fn tile_data(&self) -> &[u8] {
         &self.0[0x8000 - VRAM_BASE_ADDRESS..=0x97FF - VRAM_BASE_ADDRESS]
     }
 
@@ -259,10 +259,10 @@ impl Vram {
         }
     }
 
-    fn window_tile_map(&self, ctx: &Context) -> &[u8] {
+    fn window_tile_map(&self, ctx: &Context<MemoryBus>) -> &[u8] {
         self.tile_map(ctx.memory.io.lcd.lcdc.window_tile_map())
     }
-    fn window_tile_map_mut(&mut self, ctx: &mut Context) -> &mut [u8] {
+    fn window_tile_map_mut(&mut self, ctx: &mut Context<MemoryBus>) -> &mut [u8] {
         self.tile_map_mut(ctx.memory.io.lcd.lcdc.window_tile_map())
     }
 
@@ -434,7 +434,7 @@ impl OamEntry {
 }
 
 #[derive(Copy, Clone, Debug, FromRepr, PartialEq, Eq, Default)]
-pub(crate) enum Mode {
+pub enum Mode {
     #[default]
     OamScan = 2,
     PixelTransfer = 3,
@@ -452,7 +452,7 @@ struct SpritePixel {
 
 #[derive(Debug, Clone, Copy, FromRepr, Default)]
 #[repr(u8)]
-pub(crate) enum Pixel {
+pub enum Pixel {
     #[default]
     White = 0,
     LightGray,
@@ -476,9 +476,9 @@ enum PixelSource {
 
 // Reference for PPU details: https://www.youtube.com/watch?v=HyzD8pNlpwI&t=1760s
 #[derive(Default)]
-pub(crate) struct PPU {
-    pub(crate) cycle_counter: u32,
-    pub(crate) current_mode: Mode,
+pub struct PPU {
+    pub cycle_counter: u32,
+    pub current_mode: Mode,
     obj_buffer: StackArrayDeque<OamEntry, 10>,
     #[default(ArrayDeque::new(40))]
     oam_copy: ArrayDeque<OamEntry>,
@@ -493,7 +493,7 @@ pub(crate) struct PPU {
     fetching_sprite: Option<OamEntry>,
     oam_index: usize,
     #[default([Default::default(); 160*144])]
-    pub(crate) screen: [Pixel; 160 * 144],
+    pub screen: [Pixel; 160 * 144],
     stat_interrupt_line: bool,
     first_tile_fetch: bool,
 }
@@ -530,7 +530,7 @@ impl SpriteFetcherState {
 }
 
 impl PPU {
-    pub(crate) fn tick(&mut self, ctx: &mut Context) {
+    pub fn tick(&mut self, ctx: &mut Context<MemoryBus>) {
         match self.current_mode {
             Mode::OamScan => {
                 self.oam_scan(ctx);
@@ -556,8 +556,8 @@ impl PPU {
             Mode::VBlank => {
                 if self.cycle_counter == 0 && ctx.memory.io.lcd.ly == 144 {
                     ctx.memory
-                        .io
-                        .interrupt
+                        .io_mut()
+                        .interrupt_flag_mut()
                         .schedule_interrupt(crate::context::InterruptType::VBlank);
                 }
                 if self.cycle_counter == 455 {
@@ -592,7 +592,7 @@ impl PPU {
         self.stat_interrupt_line = stat_line;
     }
 
-    fn oam_scan(&mut self, ctx: &mut Context) {
+    fn oam_scan(&mut self, ctx: &mut Context<MemoryBus>) {
         match self.cycle_counter {
             0 => {
                 self.obj_buffer.clear();
@@ -620,7 +620,7 @@ impl PPU {
         }
     }
 
-    fn pixel_transfer(&mut self, ctx: &mut Context) {
+    fn pixel_transfer(&mut self, ctx: &mut Context<MemoryBus>) {
         if self.cycle_counter == 80 {
             self.screen_x = 0;
             self.scx_counter = ctx.memory.io.lcd.scx % 8;
@@ -679,7 +679,7 @@ impl PPU {
         }
     }
 
-    fn bg_fetch(&mut self, ctx: &mut Context) {
+    fn bg_fetch(&mut self, ctx: &mut Context<MemoryBus>) {
         let BgFetcherState {
             tile_no,
             data_low,
@@ -751,7 +751,7 @@ impl PPU {
     //     });
     // }
 
-    fn fetch_bg_tile(&mut self, ctx: &mut Context) {
+    fn fetch_bg_tile(&mut self, ctx: &mut Context<MemoryBus>) {
         let first_fetch_offset = if self.first_tile_fetch { 0u8 } else { 8u8 };
         let in_window = false
             && self.screen_x >= ctx.memory.io.lcd.wx
@@ -780,7 +780,7 @@ impl PPU {
             Some(ctx.memory.vram.tile_map(tile_map_area)[tile_map_index as usize]);
     }
 
-    fn sprite_fetch(&mut self, ctx: &mut Context) {
+    fn sprite_fetch(&mut self, ctx: &mut Context<MemoryBus>) {
         {
             let SpriteFetcherState {
                 tile_no,
@@ -879,7 +879,7 @@ impl PPU {
         }
     }
 
-    fn fetch_sprite_tile(&mut self, ctx: &mut Context) {
+    fn fetch_sprite_tile(&mut self, ctx: &mut Context<MemoryBus>) {
         if let Some((oam_index, current_sprite)) = self.sprites_to_fetch.front() {
             self.sprite_fetcher_state.tile_line = ctx
                 .memory

@@ -3,16 +3,16 @@ use core::ops::Deref;
 use core::ops::DerefMut;
 
 #[derive(Default, Debug)]
-pub(crate) struct Registers {
-    pub(crate) sp: u16,
-    pub(crate) a: u8,
-    pub(crate) b: u8,
-    pub(crate) c: u8,
-    pub(crate) d: u8,
-    pub(crate) e: u8,
-    pub(crate) f: FlagsRegister,
-    pub(crate) h: u8,
-    pub(crate) l: u8,
+pub struct Registers {
+    pub sp: u16,
+    pub a: u8,
+    pub b: u8,
+    pub c: u8,
+    pub d: u8,
+    pub e: u8,
+    pub f: FlagsRegister,
+    pub h: u8,
+    pub l: u8,
 }
 
 impl Registers {
@@ -50,7 +50,7 @@ impl Registers {
 
 #[repr(transparent)]
 #[derive(Default, Debug, Copy, Clone)]
-pub(crate) struct FlagsRegister(u8);
+pub struct FlagsRegister(u8);
 
 impl FlagsRegister {
     pub(crate) fn new(value: u8) -> Self {

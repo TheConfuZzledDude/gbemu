@@ -1,13 +1,15 @@
+use core::marker::PhantomData;
+
 use better_default::Default;
 use tap::Conv;
 use tracing::{debug, error};
 
-use crate::context::{self, Context};
+use crate::context::{self, Context, InterruptRegister, Io, Memory};
 
-pub(crate) mod registers;
+pub mod registers;
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum Operation {
+pub enum Operation {
     Nop,
     Halt,
     Load(Target, Target),
@@ -49,7 +51,7 @@ pub(crate) enum Operation {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Registers8 {
+pub enum Registers8 {
     A,
     B,
     C,
@@ -60,7 +62,7 @@ pub(crate) enum Registers8 {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Registers16 {
+pub enum Registers16 {
     BC,
     DE,
     HL,
@@ -70,7 +72,7 @@ pub(crate) enum Registers16 {
 
 #[derive(Debug, Clone, Copy)]
 
-pub(crate) enum Indirect {
+pub enum Indirect {
     R16(Registers16),
     Imm16(u16),
     HLI,
@@ -80,7 +82,7 @@ pub(crate) enum Indirect {
 
 #[derive(Debug, Clone, Copy)]
 
-pub(crate) enum Target {
+pub enum Target {
     R8(Registers8),
     R16(Registers16),
     Imm8(u8),
@@ -90,7 +92,7 @@ pub(crate) enum Target {
 
 #[derive(Debug, Clone, Copy)]
 
-pub(crate) enum Condition {
+pub enum Condition {
     None,
     NZ,
     Z,
@@ -100,20 +102,20 @@ pub(crate) enum Condition {
 
 #[derive(Debug, Clone, Copy)]
 
-pub(crate) enum RotationType {
+pub enum RotationType {
     Circular,
     NonCircular,
 }
 
 #[derive(Debug, Clone, Copy)]
 
-pub(crate) enum Direction {
+pub enum Direction {
     Left,
     Right,
 }
 
 #[derive(Debug, Default)]
-enum State {
+pub enum State {
     Decode(usize),
     Execute(Operation, usize),
     #[default]
@@ -122,16 +124,17 @@ enum State {
 }
 
 #[derive(Default)]
-pub(crate) struct CPU {
-    pub(crate) registers: registers::Registers,
-    pub(crate) pc: u16,
-    pub(crate) ir: u8,
-    pub(crate) ime: bool,
-    pub(crate) halted: bool,
-    pub(crate) state: State,
+pub struct CPU<T> {
+    pub registers: registers::Registers,
+    pub pc: u16,
+    pub ir: u8,
+    pub ime: bool,
+    pub halted: bool,
+    pub state: State,
     pub(crate) decode_state: DecodeState,
     pub(crate) execute_state: ExecuteState,
     interrupt_address: u16,
+    _phantom: PhantomData<T>,
 }
 
 #[derive(Default)]
@@ -155,33 +158,21 @@ pub(crate) struct ExecuteState {
     z_sign: bool,
 }
 
-impl CPU {
-    pub(crate) fn timer_tick(&mut self, ctx: &mut Context) {
-        ctx.memory.io.timer.tima_written = false;
-        let tima_overflow = ctx.memory.io.timer.tima_overflow;
-        ctx.memory.io.timer.tima_overflow = None;
-        ctx.memory.io.timer.clock_tick();
-        if let Some(tma) = tima_overflow {
-            ctx.memory
-                .io
-                .timer
-                .handle_overflow(tma, &mut ctx.memory.io.interrupt);
-        }
-    }
-    pub(crate) fn increment_pc(&mut self, ctx: &mut Context) {
+impl<T: Memory + Default> CPU<T> {
+    pub(crate) fn timer_tick(&mut self, ctx: &mut Context<T>) {}
+    pub fn increment_pc(&mut self, ctx: &mut Context<T>) {
         self.pc = self.pc.wrapping_add(1);
     }
 
-    pub(crate) fn load_boot_rom(&mut self, rom: &[u8], ctx: &mut Context) {
-        ctx.memory.rom[..rom.len()].copy_from_slice(rom);
+    pub fn load_boot_rom(&mut self, rom: &[u8], ctx: &mut Context<T>) {
+        ctx.memory.load_boot_rom(rom);
     }
 
-    pub(crate) fn load_rom(&mut self, rom: &[u8], ctx: &mut Context) {
-        ctx.memory.rom.copy_from_slice(&rom[..1024 * 16]);
-        ctx.memory.rom_banks[0].copy_from_slice(&rom[1024 * 16..]);
+    pub fn load_rom(&mut self, rom: &[u8], ctx: &mut Context<T>) {
+        ctx.memory.load_rom(rom);
     }
 
-    pub(crate) fn load_debug_initial_state(&mut self, _ctx: &mut Context) {
+    pub fn load_debug_initial_state(&mut self, _ctx: &mut Context<T>) {
         self.registers.a = 0x01;
         *self.registers.f = 0xB0;
         self.registers.b = 0x00;
@@ -194,8 +185,8 @@ impl CPU {
         self.pc = 0x0100;
     }
 
-    pub(crate) fn startup(&mut self, ctx: &mut Context) {
-        debug!(
+    pub fn dump_state(&mut self, ctx: &mut Context<T>) -> String {
+        format!(
             "A:{:02X} F:{:02X} B:{:02X} C:{:02X} D:{:02X} E:{:02X} H:{:02X} L:{:02X} SP:{:04X} PC:{:04X} PCMEM:{:02X},{:02X},{:02X},{:02X}",
             self.registers.a,
             *self.registers.f,
@@ -208,20 +199,20 @@ impl CPU {
             self.registers.sp,
             self.pc,
             ctx.memory.read_u8(self.pc),
-            ctx.memory.read_u8(self.pc + 1),
-            ctx.memory.read_u8(self.pc + 2),
-            ctx.memory.read_u8(self.pc + 3),
-        );
+            ctx.memory.read_u8(self.pc.wrapping_add(1)),
+            ctx.memory.read_u8(self.pc.wrapping_add(2)),
+            ctx.memory.read_u8(self.pc.wrapping_add(3)),
+        )
     }
 
-    pub(crate) fn tick(&mut self, ctx: &mut Context) {
-        if self.halted && (ctx.memory.io.interrupt.interrupt_flag & ctx.memory.ie) != 0 {
+    pub fn tick(&mut self, ctx: &mut Context<T>) {
+        if self.halted && (ctx.memory.io().interrupt_flag().read() & ctx.memory.ie()) != 0 {
             self.halted = false;
             self.pc = self.pc.wrapping_add(1);
         }
 
         if let State::Decode(0) = self.state
-            && (ctx.memory.io.interrupt.interrupt_flag & ctx.memory.ie) != 0
+            && (ctx.memory.io().interrupt_flag().read() & ctx.memory.ie()) != 0
             && self.ime
         {
             self.state = State::HandlingInterrupts(0);
@@ -266,13 +257,13 @@ impl CPU {
         self.timer_tick(ctx);
     }
 
-    pub(crate) fn handle_interrupts(&mut self, ctx: &mut Context) {
+    pub(crate) fn handle_interrupts(&mut self, ctx: &mut Context<T>) {
         let State::HandlingInterrupts(step) = self.state else {
             unreachable!()
         };
         match step {
             0 => {
-                let masked = ctx.memory.io.interrupt.interrupt_flag & ctx.memory.ie;
+                let masked = ctx.memory.io().interrupt_flag().read() & ctx.memory.ie();
                 let next_interrupt = if masked & 0b1 != 0 {
                     context::InterruptType::VBlank
                 } else if masked & 0b10 != 0 {
@@ -293,7 +284,10 @@ impl CPU {
                     context::InterruptType::LCD => 0x0048,
                     context::InterruptType::VBlank => 0x0040,
                 };
-                ctx.memory.io.interrupt.clear_interrupt(next_interrupt);
+                ctx.memory
+                    .io_mut()
+                    .interrupt_flag_mut()
+                    .clear_interrupt(next_interrupt);
                 self.interrupt_address = address;
                 self.ime = false;
                 self.pc = self.pc.wrapping_sub(1);
@@ -313,13 +307,14 @@ impl CPU {
     }
 
     #[inline(never)]
-    pub(crate) fn decode(&mut self, ctx: &mut Context) {
+    pub(crate) fn decode(&mut self, ctx: &mut Context<T>) {
         use Registers8::*;
         use Registers16::*;
         use Target::*;
         let State::Decode(step) = self.state else {
             unreachable!()
         };
+
         match decompose_octal_triplet(self.ir) {
             // https://gbdev.io/gb-opcodes/optables/octal
             (0o0, 0o0, 0o0) => self.state = State::Execute(Operation::Nop, 0),
@@ -383,6 +378,7 @@ impl CPU {
                         0 => {
                             self.decode_state.lsb = ctx.memory.read_u8(self.pc);
                             self.increment_pc(ctx);
+                            println!("{step}, {op}, {}", self.decode_state.lsb);
                         }
                         1 => {
                             self.decode_state.msb = ctx.memory.read_u8(self.pc);
@@ -842,7 +838,7 @@ impl CPU {
         }
     }
 
-    pub(crate) fn fetch_cb_operation(&mut self, ctx: &mut Context) {
+    pub(crate) fn fetch_cb_operation(&mut self, ctx: &mut Context<T>) {
         use Registers8::*;
         use Registers16::*;
         use Target::*;
@@ -897,7 +893,7 @@ impl CPU {
         }
     }
 
-    pub(crate) fn execute_operation(&mut self, operation: Operation, ctx: &mut Context) {
+    pub(crate) fn execute_operation(&mut self, operation: Operation, ctx: &mut Context<T>) {
         let State::Execute(_, step) = self.state else {
             unreachable!()
         };
@@ -1271,11 +1267,13 @@ impl CPU {
                     self.registers.sp = self.registers.sp.wrapping_sub(1);
                 }
                 1 => {
-                    ctx.memory.set_u8(self.registers.sp, self.execute_state.msb);
+                    ctx.memory
+                        .write_u8(self.registers.sp, self.execute_state.msb);
                     self.registers.sp = self.registers.sp.wrapping_sub(1);
                 }
                 2 => {
-                    ctx.memory.set_u8(self.registers.sp, self.execute_state.lsb);
+                    ctx.memory
+                        .write_u8(self.registers.sp, self.execute_state.lsb);
                 }
                 3 => {
                     self.state = State::ExecutionDone;
@@ -1410,11 +1408,13 @@ impl CPU {
                         }
                     }
                     2 => {
-                        ctx.memory.set_u8(self.registers.sp, self.execute_state.msb);
+                        ctx.memory
+                            .write_u8(self.registers.sp, self.execute_state.msb);
                         self.registers.sp = self.registers.sp.wrapping_sub(1);
                     }
                     3 => {
-                        ctx.memory.set_u8(self.registers.sp, self.execute_state.lsb);
+                        ctx.memory
+                            .write_u8(self.registers.sp, self.execute_state.lsb);
                         let Target::Imm16(address) = target else {
                             unimplemented!("Invalid target for operation");
                         };
@@ -1434,11 +1434,13 @@ impl CPU {
                     self.execute_state.msb = msb;
                 }
                 1 => {
-                    ctx.memory.set_u8(self.registers.sp, self.execute_state.msb);
+                    ctx.memory
+                        .write_u8(self.registers.sp, self.execute_state.msb);
                     self.registers.sp = self.registers.sp.wrapping_sub(1);
                 }
                 2 => {
-                    ctx.memory.set_u8(self.registers.sp, self.execute_state.lsb);
+                    ctx.memory
+                        .write_u8(self.registers.sp, self.execute_state.lsb);
                     self.pc = address;
                 }
                 3 => {
@@ -1494,7 +1496,7 @@ impl CPU {
                             .set_subtract(false)
                             .set_half_carry(false)
                             .set_carry(carry);
-                        ctx.memory.set_u8(self.registers.hl(), result);
+                        ctx.memory.write_u8(self.registers.hl(), result);
                     }
                     2 => {
                         self.state = State::ExecutionDone;
@@ -1537,7 +1539,7 @@ impl CPU {
                             .set_subtract(false)
                             .set_half_carry(false)
                             .set_carry(false);
-                        ctx.memory.set_u8(self.registers.hl(), result);
+                        ctx.memory.write_u8(self.registers.hl(), result);
                     }
                     2 => {
                         self.state = State::ExecutionDone;
@@ -1578,7 +1580,7 @@ impl CPU {
                             .set_subtract(false)
                             .set_half_carry(false)
                             .set_carry(carry);
-                        ctx.memory.set_u8(self.registers.hl(), result);
+                        ctx.memory.write_u8(self.registers.hl(), result);
                     }
                     2 => {
                         self.state = State::ExecutionDone;
@@ -1630,7 +1632,7 @@ impl CPU {
                     }
                     1 => {
                         let result = self.execute_state.value & !(0b1 << bit);
-                        ctx.memory.set_u8(self.registers.hl(), result);
+                        ctx.memory.write_u8(self.registers.hl(), result);
                     }
                     2 => {
                         self.state = State::ExecutionDone;
@@ -1653,7 +1655,7 @@ impl CPU {
                     }
                     1 => {
                         let result = self.execute_state.value | (0b1 << bit);
-                        ctx.memory.set_u8(self.registers.hl(), result);
+                        ctx.memory.write_u8(self.registers.hl(), result);
                     }
                     2 => {
                         self.state = State::ExecutionDone;
@@ -1668,12 +1670,12 @@ impl CPU {
         }
     }
 
-    pub(crate) fn halt(&mut self, _ctx: &mut Context) {
+    pub(crate) fn halt(&mut self, _ctx: &mut Context<T>) {
         self.halted = false;
         self.state = State::ExecutionDone;
     }
 
-    pub(crate) fn load(&mut self, destination: Target, source: Target, ctx: &mut Context) {
+    pub(crate) fn load(&mut self, destination: Target, source: Target, ctx: &mut Context<T>) {
         let State::Execute(_, step) = self.state else {
             unreachable!()
         };
@@ -1717,7 +1719,7 @@ impl CPU {
         &mut self,
         destination: Target,
         value: u8,
-        ctx: &mut Context,
+        ctx: &mut Context<T>,
         starting_step: usize,
     ) {
         let State::Execute(_, step) = self.state else {
@@ -1735,22 +1737,22 @@ impl CPU {
             Target::Ind(indirect) => match step {
                 val if val == starting_step => match indirect {
                     Indirect::R16(register) => {
-                        ctx.memory.set_u8(self.read_register16(register), value);
+                        ctx.memory.write_u8(self.read_register16(register), value);
                     }
                     Indirect::Imm16(address) => {
-                        ctx.memory.set_u8(address, value);
+                        ctx.memory.write_u8(address, value);
                     }
                     Indirect::HLI => {
-                        ctx.memory.set_u8(self.registers.hl(), value);
+                        ctx.memory.write_u8(self.registers.hl(), value);
                         self.registers.set_hl(self.registers.hl().wrapping_add(1));
                     }
                     Indirect::HLD => {
-                        ctx.memory.set_u8(self.registers.hl(), value);
+                        ctx.memory.write_u8(self.registers.hl(), value);
                         self.registers.set_hl(self.registers.hl().wrapping_sub(1));
                     }
                     Indirect::C => {
                         let addr = u16::from_le_bytes([self.registers.c, 0xFF]);
-                        ctx.memory.set_u8(addr, value);
+                        ctx.memory.write_u8(addr, value);
                     }
                 },
                 val if val == starting_step + 1 => {
@@ -1765,7 +1767,7 @@ impl CPU {
         &mut self,
         destination: Target,
         value: u16,
-        ctx: &mut Context,
+        ctx: &mut Context<T>,
         starting_step: usize,
     ) {
         let State::Execute(_, step) = self.state else {
@@ -1787,11 +1789,11 @@ impl CPU {
                         let [lsb, msb] = value.to_le_bytes();
                         // debug!("{lsb:02X}, {msb:02X}");
                         self.execute_state.msb = msb;
-                        ctx.memory.set_u8(address, lsb);
+                        ctx.memory.write_u8(address, lsb);
                     }
                     x if x == starting_step + 1 => {
                         ctx.memory
-                            .set_u8(address.wrapping_add(1), self.execute_state.msb);
+                            .write_u8(address.wrapping_add(1), self.execute_state.msb);
                         self.state = State::ExecutionDone;
                     }
                     _ => unreachable!(),
@@ -1844,7 +1846,7 @@ impl CPU {
         };
     }
 
-    pub(crate) fn increment(&mut self, target: Target, ctx: &mut Context) {
+    pub(crate) fn increment(&mut self, target: Target, ctx: &mut Context<T>) {
         let State::Execute(_, step) = self.state else {
             unreachable!()
         };
@@ -1879,7 +1881,7 @@ impl CPU {
                     1 => {
                         let (result, _carry) = self.execute_state.value.overflowing_add(1);
                         let half_carry = self.execute_state.value & 0x0F == 0x0F;
-                        ctx.memory.set_u8(self.execute_state.address, result);
+                        ctx.memory.write_u8(self.execute_state.address, result);
                         self.registers
                             .f
                             .set_zero(result == 0)
@@ -1895,7 +1897,7 @@ impl CPU {
         }
     }
 
-    pub(crate) fn decrement(&mut self, target: Target, ctx: &mut Context) {
+    pub(crate) fn decrement(&mut self, target: Target, ctx: &mut Context<T>) {
         let State::Execute(_, step) = self.state else {
             unreachable!()
         };
@@ -1931,7 +1933,7 @@ impl CPU {
                     1 => {
                         let result = self.execute_state.value.wrapping_sub(1);
                         let half_carry = self.execute_state.value & 0x0F == 0;
-                        ctx.memory.set_u8(self.execute_state.address, result);
+                        ctx.memory.write_u8(self.execute_state.address, result);
                         // debug!("Result: {}", result);
                         // debug!(
                         // "Written Memory: {}",
@@ -1953,11 +1955,11 @@ impl CPU {
         }
     }
 
-    pub(crate) fn stop(&self, _ctx: &mut Context) {
+    pub(crate) fn stop(&self, _ctx: &mut Context<T>) {
         todo!()
     }
 
-    pub(crate) fn jump(&mut self, condition: Condition, target: Target, ctx: &mut Context) {
+    pub(crate) fn jump(&mut self, condition: Condition, target: Target, ctx: &mut Context<T>) {
         // debug!("Jump! {target:?}");
         let State::Execute(_, step) = self.state else {
             unreachable!()
@@ -2001,7 +2003,7 @@ impl CPU {
         }
     }
 
-    pub(crate) fn jump_relative(&mut self, condition: Condition, offset: i8, ctx: &mut Context) {
+    pub(crate) fn jump_relative(&mut self, condition: Condition, offset: i8, ctx: &mut Context<T>) {
         let State::Execute(_, step) = self.state else {
             unreachable!()
         };
@@ -2034,7 +2036,7 @@ impl CPU {
         &mut self,
         rotation_type: RotationType,
         direction: Direction,
-        _ctx: &mut Context,
+        _ctx: &mut Context<T>,
     ) {
         let (result, carry) = match (rotation_type, direction) {
             (RotationType::Circular, Direction::Left) => {
@@ -2075,7 +2077,7 @@ impl CPU {
         rotation_type: RotationType,
         direction: Direction,
         target: Target,
-        ctx: &mut Context,
+        ctx: &mut Context<T>,
     ) {
         let State::Execute(_, step) = self.state else {
             unreachable!()
@@ -2130,7 +2132,7 @@ impl CPU {
                         .set_subtract(false)
                         .set_half_carry(false)
                         .set_carry(carry);
-                    ctx.memory.set_u8(self.registers.hl(), result);
+                    ctx.memory.write_u8(self.registers.hl(), result);
                 }
                 2 => {
                     self.state = State::ExecutionDone;
